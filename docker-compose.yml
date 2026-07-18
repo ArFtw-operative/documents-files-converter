@@ -1,0 +1,111 @@
+name: convertvault
+x-api-env: &api-env
+  APP_NAME: ${APP_NAME:-ConvertVault}
+  APP_ENV: ${APP_ENV:-production}
+  APP_URL: ${APP_URL:-http://localhost}
+  SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+  DATABASE_URL: postgresql+psycopg://convertvault:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/convertvault
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  STORAGE_PROVIDER: ${STORAGE_PROVIDER:-s3}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-convertvault}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}
+  S3_BUCKET: ${S3_BUCKET:-convertvault}
+  LOCAL_STORAGE_PATH: /data/files
+  CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost}
+
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: workers/Dockerfile
+  environment: *api-env
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp:rw,noexec,nosuid,size=1g]
+  volumes: [local_files:/data/files]
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+    minio-init: {condition: service_completed_successfully}
+  networks: [internal]
+  security_opt: [no-new-privileges:true]
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    environment:
+      POSTGRES_DB: convertvault
+      POSTGRES_USER: convertvault
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: {test: [CMD-SHELL, pg_isready -U convertvault], interval: 10s, timeout: 5s, retries: 10}
+    restart: unless-stopped
+    networks: [internal]
+  redis:
+    image: redis:7.4.3-alpine
+    command: [redis-server, --appendonly, 'yes', --maxmemory-policy, noeviction]
+    volumes: [redis_data:/data]
+    healthcheck: {test: [CMD, redis-cli, ping], interval: 10s, timeout: 3s, retries: 10}
+    restart: unless-stopped
+    networks: [internal]
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address :9001
+    environment: {MINIO_ROOT_USER: '${S3_ACCESS_KEY:-convertvault}', MINIO_ROOT_PASSWORD: '${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}'}
+    volumes: [minio_data:/data]
+    healthcheck: {test: [CMD, mc, ready, local], interval: 10s, timeout: 5s, retries: 10}
+    restart: unless-stopped
+    networks: [internal]
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on: {minio: {condition: service_healthy}}
+    entrypoint: ['/bin/sh','-c','mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" && mc mb --ignore-existing local/$${S3_BUCKET}']
+    environment: {MINIO_ROOT_USER: '${S3_ACCESS_KEY:-convertvault}', MINIO_ROOT_PASSWORD: '${S3_SECRET_KEY:?Set S3_SECRET_KEY in .env}', S3_BUCKET: '${S3_BUCKET:-convertvault}'}
+    networks: [internal]
+  migrate:
+    build: {context: ., dockerfile: apps/api/Dockerfile}
+    command: [alembic, upgrade, head]
+    environment: *api-env
+    depends_on: {postgres: {condition: service_healthy}}
+    networks: [internal]
+  api:
+    build: {context: ., dockerfile: apps/api/Dockerfile}
+    environment: *api-env
+    volumes: [local_files:/data/files]
+    depends_on: {migrate: {condition: service_completed_successfully}, redis: {condition: service_healthy}, minio-init: {condition: service_completed_successfully}}
+    healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"], interval: 15s, timeout: 5s, retries: 10}
+    restart: unless-stopped
+    networks: [internal]
+  worker-image:
+    <<: *worker
+    command: [celery, -A, 'convertvault.celery_app:celery', worker, -Q, image, --concurrency, '${WORKER_CONCURRENCY_IMAGE:-2}', --loglevel, INFO]
+  worker-pdf:
+    <<: *worker
+    command: [celery, -A, 'convertvault.celery_app:celery', worker, -Q, pdf, --concurrency, '${WORKER_CONCURRENCY_PDF:-1}', --loglevel, INFO]
+  worker-office:
+    <<: *worker
+    command: [celery, -A, 'convertvault.celery_app:celery', worker, -Q, office, --concurrency, '${WORKER_CONCURRENCY_OFFICE:-1}', --loglevel, INFO]
+  worker-general:
+    <<: *worker
+    command: [celery, -A, 'convertvault.celery_app:celery', worker, -Q, general, --concurrency, '${WORKER_CONCURRENCY_GENERAL:-2}', --loglevel, INFO]
+  scheduler:
+    <<: *worker
+    command: [celery, -A, 'convertvault.celery_app:celery', beat, --loglevel, INFO]
+  web:
+    build: {context: ., dockerfile: apps/web/Dockerfile, args: {NEXT_PUBLIC_API_URL: ''}}
+    depends_on: {api: {condition: service_healthy}}
+    healthcheck: {test: [CMD, wget, -qO-, http://localhost:3000], interval: 15s, timeout: 5s, retries: 10}
+    restart: unless-stopped
+    networks: [internal]
+  proxy:
+    image: caddy:2.10.0-alpine
+    ports: ['80:80', '443:443']
+    volumes: ['./infrastructure/reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro', caddy_data:/data, caddy_config:/config]
+    depends_on: {web: {condition: service_healthy}}
+    restart: unless-stopped
+    networks: [internal]
+
+networks: {internal: {}}
+volumes: {postgres_data: {}, redis_data: {}, minio_data: {}, local_files: {}, caddy_data: {}, caddy_config: {}}

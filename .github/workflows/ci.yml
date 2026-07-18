@@ -1,0 +1,27 @@
+name: CI
+on: [push, pull_request]
+permissions: {contents: read}
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12', cache: pip}
+      - run: pip install -r apps/api/requirements.txt
+      - run: pytest -q
+      - run: python -m compileall apps/api
+  web:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: apps/web}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22', cache: npm, cache-dependency-path: apps/web/package-lock.json}
+      - run: npm ci
+      - run: npm run build
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: SECRET_KEY=12345678901234567890123456789012 POSTGRES_PASSWORD=test-password S3_SECRET_KEY=test-password docker compose config --quiet
