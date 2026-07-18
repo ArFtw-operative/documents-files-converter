@@ -1,10 +1,12 @@
 import zipfile
 
 import fitz
+import pytest
+from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfReader
 
 from convertvault.engines.base import ConversionContext
-from convertvault.engines.pdf import PdfEngine
+from convertvault.engines.pdf import PdfEngine, TesseractPdfOcrEngine
 
 
 def make_pdf(path, pages=1, text="ConvertVault"):
@@ -83,3 +85,21 @@ def test_flatten_repair_and_sanitize_produce_clean_valid_pdfs(tmp_path):
     reader = PdfReader(sanitized)
     assert len(reader.pages) == 1
     assert set((reader.metadata or {}).keys()) <= {"/Producer"}
+
+
+@pytest.mark.skipif(not TesseractPdfOcrEngine().available(), reason="Tesseract is not installed")
+def test_tesseract_fallback_builds_a_searchable_pdf_from_a_real_scan(tmp_path):
+    image_path = tmp_path / "scan.png"
+    image = Image.new("RGB", (1600, 500), "white")
+    draw = ImageDraw.Draw(image)
+    font_path = r"C:\Windows\Fonts\arial.ttf"
+    font = ImageFont.truetype(font_path, 96) if __import__("pathlib").Path(font_path).is_file() else ImageFont.load_default()
+    draw.text((90, 170), "SCAN VERIFY 4827", fill="black", font=font)
+    image.save(image_path, dpi=(300, 300))
+    source, output = tmp_path / "scan.pdf", tmp_path / "searchable.pdf"
+    document = fitz.open(); page = document.new_page(width=600, height=220)
+    page.insert_image(page.rect, filename=str(image_path)); document.save(source); document.close()
+    TesseractPdfOcrEngine().convert(context(source, output, "pdf.ocr", {"language": "eng", "dpi": 300}))
+    with fitz.open(output) as searchable:
+        text = searchable[0].get_text("text").upper()
+        assert "SCAN VERIFY" in text and "4827" in text

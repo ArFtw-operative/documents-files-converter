@@ -191,6 +191,43 @@ def test_setup_upload_library_and_authorization(monkeypatch):
         )
         assert session_response.status_code == 201
         session = session_response.json()
+        rejected_command = client.post(
+            f"/api/v1/pdf/sessions/{session['id']}/commands", headers=headers,
+            json={"expected_revision": 0, "idempotency_key": "reject-overflow-001",
+                  "operation": {"kind": "content.add_text", "page": 1,
+                                "rect": [40, 80, 42, 82],
+                                "text": "This cannot possibly fit inside a two-point box",
+                                "font_size": 24}},
+        )
+        assert rejected_command.status_code == 422
+        assert "Text does not fit" in str(rejected_command.json()["detail"])
+        healthy_after_rejection = client.get(
+            f"/api/v1/pdf/sessions/{session['id']}/scene?page=1", headers=headers
+        )
+        assert healthy_after_rejection.status_code == 200
+        rejected_history = client.get(
+            f"/api/v1/pdf/sessions/{session['id']}/commands", headers=headers
+        ).json()
+        assert rejected_history["revision"] == 0 and rejected_history["items"] == []
+        seeded_session_response = client.post(
+            f"/api/v1/pdf/documents/{document_id}/sessions", headers=headers,
+            json={"operations": [{"kind": "content.add_text", "page": 1,
+                                  "rect": [40, 80, 300, 112],
+                                  "text": "Seeded saved revision", "font_size": 11}]},
+        )
+        assert seeded_session_response.status_code == 201
+        seeded_session = seeded_session_response.json()
+        assert seeded_session["revision"] == 1 and seeded_session["cursor"] == 1
+        seeded_scene = client.get(
+            f"/api/v1/pdf/sessions/{seeded_session['id']}/scene?page=1", headers=headers
+        )
+        assert seeded_scene.status_code == 200
+        assert any(item.get("text") == "Seeded saved revision"
+                   for item in seeded_scene.json()["objects"])
+        seeded_history = client.get(
+            f"/api/v1/pdf/sessions/{seeded_session['id']}/commands", headers=headers
+        ).json()
+        assert len(seeded_history["items"]) == 1
         page_import = client.post(
             f"/api/v1/pdf/sessions/{session['id']}/pages/import", headers=headers,
             json={"expected_revision": 0, "idempotency_key": "import-page-001", "action": "insert",
@@ -367,7 +404,7 @@ def test_setup_upload_library_and_authorization(monkeypatch):
         run_conversion.run(session_export.json()["id"])
         exported_job = client.get("/api/v1/jobs", headers=headers).json()["items"]
         exported_job = next(item for item in exported_job if item["id"] == session_export.json()["id"])
-        assert exported_job["status"] == "succeeded"
+        assert exported_job["status"] == "succeeded", exported_job
         workspace_versions = client.get(
             f"/api/v1/pdf/documents/{document_id}/versions", headers=headers
         ).json()["items"]

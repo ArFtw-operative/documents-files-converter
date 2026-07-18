@@ -81,6 +81,28 @@ def test_editor_adds_image_asset_and_rejects_unsafe_links(tmp_path):
         raise AssertionError("Unsafe links must be rejected")
 
 
+def test_existing_link_can_update_and_delete(tmp_path):
+    source, updated, deleted = tmp_path / "link.pdf", tmp_path / "link-updated.pdf", tmp_path / "link-deleted.pdf"
+    with fitz.open() as document:
+        page = document.new_page(width=400, height=500)
+        page.insert_text((40, 60), "Visit link")
+        page.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(40, 40, 130, 70),
+                          "uri": "https://example.com/old"})
+        document.save(source)
+    link = next(item for item in build_page_scene(
+        source, "99999999-9999-4999-8999-999999999999", 1
+    )["objects"] if item["type"] == "link")
+    update = {"kind": "link.update", "page": 1, "source_xref": link["source"]["xref"],
+              "uri": "https://example.com/new"}
+    edit(source, updated, [update])
+    with fitz.open(updated) as document:
+        assert document[0].get_links()[0]["uri"] == "https://example.com/new"
+    remove = {"kind": "link.delete", "page": 1, "source_xref": link["source"]["xref"]}
+    edit(source, deleted, [remove])
+    with fitz.open(deleted) as document:
+        assert document[0].get_links() == []
+
+
 def test_edit_validation_renders_changes_and_proves_untouched_page_fidelity(tmp_path):
     source, output = tmp_path / "source.pdf", tmp_path / "validated.pdf"
     make_pdf(source)
@@ -146,6 +168,85 @@ def test_native_text_object_range_edit_preserves_style_and_creates_searchable_co
         assert round(span["size"], 1) == round(text_object["style"]["font_size"], 1)
         assert f"#{int(span['color']) & 0xFFFFFF:06x}" == text_object["style"]["color"]
     assert report["valid"] is True
+
+
+def test_multiline_paragraph_is_a_real_scene_object_and_reflows_when_edited(tmp_path):
+    source, output = tmp_path / "paragraph.pdf", tmp_path / "paragraph-edited.pdf"
+    with fitz.open() as document:
+        page = document.new_page(width=420, height=500)
+        page.insert_textbox(
+            fitz.Rect(40, 50, 360, 150),
+            "First line of the original paragraph.\nSecond line stays in the same block.",
+            fontname="helv",
+            fontsize=12,
+        )
+        document.save(source)
+
+    scene = build_page_scene(source, "88888888-8888-4888-8888-888888888888", 1)
+    paragraph = next(item for item in scene["objects"] if item["type"] == "text_block")
+    assert paragraph["line_count"] == 2
+    assert paragraph["style"]["font_resource"]
+    replacement = "This paragraph was edited as a complete multiline block.\nIts second line is searchable too."
+    operation = {
+        "kind": "content.edit_text_block",
+        "page": 1,
+        "object_id": paragraph["id"],
+        "rect": paragraph["bounds"],
+        "origin": paragraph["bounds"][:2],
+        "text": paragraph["text"],
+        "replacement": replacement,
+        "range_start": 0,
+        "range_end": len(paragraph["text"]),
+        "font": "Helvetica",
+        "font_size": paragraph["style"]["font_size"],
+        "font_resource": paragraph["style"]["font_resource"],
+        "font_xref": paragraph["style"]["font_xref"],
+        "color": paragraph["style"]["color"],
+        "reflow_policy": "reduce_font",
+        "font_policy": "preserve_or_prompt",
+    }
+    edit(source, output, [operation])
+    report = validate_edited_pdf(source, output, [operation])
+    with fitz.open(output) as document:
+        text = " ".join(document[0].get_text("text").split())
+        assert "original paragraph" not in text
+        assert "This paragraph was edited as a complete multiline block." in text
+        assert "Its second line is searchable too." in text
+        assert sum(1 for _ in (document[0].annots() or [])) == 0
+    assert report["valid"] is True
+
+
+def test_text_validation_is_region_aware_and_allows_later_overlapping_edits(tmp_path):
+    source, output = tmp_path / "region-source.pdf", tmp_path / "region-edited.pdf"
+    with fitz.open() as document:
+        page = document.new_page(width=420, height=500)
+        page.insert_text((40, 60), "Repeated title")
+        page.insert_text((40, 300), "Repeated title remains elsewhere")
+        document.save(source)
+    paragraph = next(item for item in build_page_scene(
+        source, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1
+    )["objects"] if item["type"] == "text_block" and item["text"] == "Repeated title")
+    add_rect = [*paragraph["bounds"]]
+    add_rect[3] += 30
+    add = {"kind": "content.add_text", "page": 1, "rect": add_rect,
+           "text": "Temporary", "font": "Helvetica", "font_size": 6}
+    replace = {
+        "kind": "content.edit_text_block", "page": 1, "object_id": paragraph["id"],
+        "rect": paragraph["bounds"], "origin": paragraph["bounds"][:2],
+        "text": paragraph["text"], "replacement": "English Translated",
+        "range_start": 0, "range_end": len(paragraph["text"]),
+        "font": paragraph["style"]["font"], "font_size": paragraph["style"]["font_size"],
+        "font_resource": paragraph["style"]["font_resource"],
+        "font_xref": paragraph["style"]["font_xref"], "color": paragraph["style"]["color"],
+        "reflow_policy": "reduce_font", "font_policy": "preserve_or_prompt",
+    }
+    edit(source, output, [add, replace])
+    assert validate_edited_pdf(source, output, [add, replace])["valid"] is True
+    with fitz.open(output) as document:
+        text = document[0].get_text("text")
+        assert "English Translated" in text
+        assert "Temporary" not in text
+        assert "Repeated title remains elsewhere" in text
 
 
 def make_object_pdf(path):
@@ -454,3 +555,63 @@ def test_bookmark_and_embedded_attachment_crud_is_native_and_recoverable(tmp_pat
     edit(output, deleted, [{"kind": "attachment.delete", "attachment_name": "evidence.txt"}])
     with fitz.open(deleted) as result:
         assert not result.embfile_names()
+
+
+def test_exposed_page_drawing_signature_watermark_header_and_form_controls_are_real(tmp_path):
+    source = tmp_path / "exposed-controls-source.pdf"
+    output = tmp_path / "exposed-controls.pdf"
+    signature = tmp_path / "signature.png"
+    make_pdf(source)
+    signature_pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 80, 24), False)
+    signature_pixmap.clear_with(0x245A3A)
+    signature_pixmap.save(signature)
+    operations = [
+        {"kind": "page.delete", "pages": [2]},
+        {"kind": "page.crop", "page": 1, "rect": [20, 20, 380, 480]},
+        {"kind": "content.draw", "page": 1,
+         "points": [[45, 150], [90, 135], [140, 165], [190, 145]],
+         "color": "#245a3a", "width": 3, "opacity": 0.9},
+        {"kind": "signature.add", "page": 1, "rect": [230, 120, 350, 170],
+         "image_file_id": "signature"},
+        {"kind": "form.text", "page": 1, "rect": [40, 210, 220, 240],
+         "field_name": "resettable", "field_value": "Changed", "default_value": "Default"},
+        {"kind": "form.text", "page": 1, "rect": [40, 255, 220, 285],
+         "field_name": "delete_me", "field_value": "Temporary"},
+        {"kind": "form.reset"},
+        {"kind": "form.delete", "page": 1, "field_name": "delete_me"},
+        {"kind": "watermark.text", "text": "CONTROLLED COPY", "font_size": 20,
+         "color": "#777777", "opacity": 0.25, "rotation": 0},
+        {"kind": "header_footer", "text": "Verified page {page}", "font_size": 9,
+         "color": "#333333"},
+    ]
+    edit(source, output, operations, {"signature": str(signature)})
+    report = validate_edited_pdf(source, output, operations)
+    with fitz.open(output) as document:
+        assert document.page_count == 1
+        page = document[0]
+        assert tuple(round(value) for value in page.cropbox) == (20, 20, 380, 480)
+        assert len(page.get_drawings()) >= 1
+        assert page.get_images(full=True)
+        widgets = {widget.field_name: widget for widget in (page.widgets() or [])}
+        assert set(widgets) == {"resettable"}
+        assert str(widgets["resettable"].field_value) == "Default"
+        text = page.get_text()
+        assert "CONTROLLED COPY" in text
+        assert "Verified page 1" in text
+    assert report["valid"] is True
+
+
+def test_duplicate_page_creates_an_independent_valid_page(tmp_path):
+    source, output = tmp_path / "duplicate-source.pdf", tmp_path / "duplicated.pdf"
+    make_pdf(source)
+    operations = [{"kind": "page.duplicate", "page": 1}]
+    edit(source, output, operations)
+    report = validate_edited_pdf(source, output, operations)
+    with fitz.open(output) as document:
+        assert document.page_count == 3
+        assert "Private draft 1" in document[0].get_text()
+        assert "Private draft 1" in document[1].get_text()
+        assert "Private draft 2" in document[2].get_text()
+        document[1].insert_text((40, 100), "Independent duplicate")
+        assert "Independent duplicate" not in document[0].get_text()
+    assert report["valid"] is True

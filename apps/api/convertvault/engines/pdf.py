@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import os
 from pathlib import Path
 
 import fitz
@@ -181,8 +182,9 @@ class OcrEngine:
         if not self.available(): return "unavailable"
         return subprocess.run(["ocrmypdf", "--version"], capture_output=True, text=True, timeout=10, check=True).stdout.strip()
     def capabilities(self) -> list[Capability]:
+        languages = tesseract_languages()
         return [Capability("pdf.ocr", ["pdf"], ["pdf"], self.engine_id, approximate=True,
-            options={"language": {"type": "string", "default": "eng"}, "deskew": {"type": "boolean", "default": True}, "rotate_pages": {"type": "boolean", "default": True}},
+            options={"language": {"type": "string", "enum": languages, "default": "eng" if "eng" in languages else languages[0]}, "deskew": {"type": "boolean", "default": True}, "rotate_pages": {"type": "boolean", "default": True}},
             limitations=["OCR accuracy depends on scan quality, orientation, typography, and installed language packs."])] if self.available() else []
     def convert(self, context: ConversionContext) -> list[Path]:
         command = ["ocrmypdf", "--skip-text", "--optimize", "1", "--language", str(context.options.get("language", "eng"))]
@@ -190,6 +192,103 @@ class OcrEngine:
         if context.options.get("rotate_pages", True): command.append("--rotate-pages")
         command.extend([str(context.source), str(context.destination)])
         subprocess.run(command, capture_output=True, text=True, timeout=1800, check=True)
+        return [context.destination]
+
+
+def tesseract_binary() -> str | None:
+    configured = os.environ.get("TESSERACT_CMD")
+    candidates = [
+        configured,
+        shutil.which("tesseract"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe"),
+    ]
+    return next((str(candidate) for candidate in candidates
+                 if candidate and Path(candidate).is_file()), None)
+
+
+def tesseract_languages() -> list[str]:
+    binary = tesseract_binary()
+    if not binary:
+        return ["eng"]
+    try:
+        result = subprocess.run([binary, "--list-langs"], capture_output=True, text=True,
+                                timeout=10, check=True)
+        languages = sorted({line.strip() for line in result.stdout.splitlines()[1:] if line.strip()})
+        return languages or ["eng"]
+    except (OSError, subprocess.SubprocessError):
+        return ["eng"]
+
+
+class TesseractPdfOcrEngine:
+    """Portable scanned-PDF OCR fallback when OCRmyPDF is unavailable."""
+
+    engine_id = "tesseract-pdf"
+    display_name = "Tesseract searchable PDF"
+
+    def available(self) -> bool:
+        return tesseract_binary() is not None
+
+    def version(self) -> str:
+        binary = tesseract_binary()
+        if not binary:
+            return "unavailable"
+        result = subprocess.run([binary, "--version"], capture_output=True, text=True,
+                                timeout=10, check=True)
+        return (result.stdout or result.stderr).splitlines()[0].strip()
+
+    def capabilities(self) -> list[Capability]:
+        if not self.available() or shutil.which("ocrmypdf"):
+            return []
+        languages = tesseract_languages()
+        return [Capability(
+            "pdf.ocr", ["pdf"], ["pdf"], self.engine_id, approximate=True,
+            options={"language": {"type": "string", "enum": languages,
+                                  "default": "eng" if "eng" in languages else languages[0]},
+                     "dpi": {"type": "integer", "minimum": 150, "maximum": 600, "default": 300}},
+            limitations=[
+                "Pages that already contain selectable text are preserved unchanged.",
+                "Scanned pages are rebuilt with their image plus a searchable Tesseract text layer.",
+                "OCR accuracy depends on scan quality, orientation, typography, and installed language packs.",
+            ],
+        )]
+
+    def convert(self, context: ConversionContext) -> list[Path]:
+        binary = tesseract_binary()
+        if not binary:
+            raise RuntimeError("Tesseract OCR is not installed")
+        language = str(context.options.get("language", "eng"))
+        dpi = max(150, min(600, int(context.options.get("dpi", 300))))
+        with fitz.open(context.source) as source, fitz.open() as output:
+            if source.needs_pass:
+                raise ValueError("Unlock this PDF before applying OCR")
+            for index, page in enumerate(source):
+                if page.get_text("text").strip():
+                    output.insert_pdf(source, from_page=index, to_page=index)
+                    continue
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
+                pixmap.set_dpi(dpi, dpi)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temporary:
+                    image_path = Path(temporary.name)
+                try:
+                    pixmap.save(image_path)
+                    result = subprocess.run(
+                        [binary, str(image_path), "stdout", "-l", language, "pdf"],
+                        capture_output=True, timeout=600, check=True,
+                    )
+                    if not result.stdout.startswith(b"%PDF"):
+                        message = result.stderr.decode("utf-8", errors="replace")[:300]
+                        raise RuntimeError(f"Tesseract did not produce a searchable PDF page: {message}")
+                    with fitz.open(stream=result.stdout, filetype="pdf") as ocr_page:
+                        output.insert_pdf(ocr_page)
+                finally:
+                    image_path.unlink(missing_ok=True)
+            if output.page_count != source.page_count:
+                raise RuntimeError("OCR output page count does not match the source PDF")
+            output.save(context.destination, garbage=4, deflate=True, use_objstms=1)
+        with fitz.open(context.destination) as check:
+            if check.page_count < 1 or not any(page.get_text("text").strip() for page in check):
+                raise RuntimeError("OCR completed but no searchable text layer was produced")
         return [context.destination]
 
 

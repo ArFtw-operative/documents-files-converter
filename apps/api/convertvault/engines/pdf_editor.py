@@ -4,6 +4,7 @@ import subprocess
 import hashlib
 import io
 import math
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,7 +28,8 @@ class PdfEditorEngine:
     def capabilities(self) -> list[Capability]:
         return [Capability(
             "pdf.edit", ["pdf"], ["pdf"], self.engine_id, approximate=True,
-            options={"operations": {"type": "array", "maximum_items": 5000}},
+            options={"operations": {"type": "array", "maximum_items": 5000},
+                     "fonts": {"type": "array", "values": available_font_families()}},
             limitations=[
                 "Direct replacement of subset-font or outlined text is reconstructed using an available font.",
                 "Signed PDFs lose signature validity when their bytes are modified; the original remains preserved.",
@@ -40,9 +42,19 @@ class PdfEditorEngine:
                 raise ValueError("The PDF is password-protected; unlock it before editing")
             additional_files = context.options.get("_additional_file_map", {})
             operations = context.options.get("operations", [])
-            for operation in (item for item in operations if not item["kind"].startswith("bookmark.")):
-                self._apply(document, operation, additional_files)
-            self._bookmark_batch(document, [item for item in operations if item["kind"].startswith("bookmark.")])
+            for index, operation in enumerate(operations, 1):
+                if operation["kind"].startswith("bookmark."):
+                    continue
+                try:
+                    self._apply(document, operation, additional_files)
+                except Exception as exc:  # noqa: BLE001 - engine faults become actionable edit errors
+                    raise ValueError(_operation_error(index, operation, exc)) from exc
+            try:
+                self._bookmark_batch(document, [item for item in operations if item["kind"].startswith("bookmark.")])
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"A bookmark edit failed: {exc}") from exc
             metadata = document.metadata or {}
             metadata["producer"] = "ConvertVault PDF Studio"
             document.set_metadata(metadata)
@@ -63,6 +75,10 @@ class PdfEditorEngine:
             indexes = sorted({self._page_index(document, page) for page in operation["pages"]}, reverse=True)
             if len(indexes) >= document.page_count: raise ValueError("A PDF editor project must retain at least one page")
             for index in indexes: document.delete_page(index)
+            return
+        if kind == "page.duplicate":
+            index = self._page_index(document, operation.get("page"))
+            document.fullcopy_page(index, to=index + 1)
             return
         if kind == "page.insert_blank":
             position = min(document.page_count, max(0, int(operation.get("page", document.page_count + 1)) - 1))
@@ -116,6 +132,11 @@ class PdfEditorEngine:
             for form_page in document:
                 for widget in form_page.widgets() or []:
                     widget.reset()
+                    value_type, default_value = document.xref_get_key(widget.xref, "DV")
+                    if value_type == "string":
+                        widget.field_value = default_value
+                    elif value_type == "name":
+                        widget.field_value = default_value.lstrip("/")
                     widget.update()
             return
         if kind == "form.flatten" and not operation.get("page"):
@@ -212,6 +233,8 @@ class PdfEditorEngine:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
         elif kind == "content.edit_text_object":
             self._edit_text_object(page, rectangle, operation)
+        elif kind == "content.edit_text_block":
+            self._edit_text_block(page, rectangle, operation)
         elif kind in {"content.transform_image", "content.replace_image_object", "content.delete_image_object"}:
             self._edit_image_object(document, page, operation, files)
         elif kind in {"content.transform_vector", "content.delete_vector_object"}:
@@ -223,15 +246,31 @@ class PdfEditorEngine:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
         elif kind.startswith("annotate."):
             self._annotation(document, page, kind, rectangle, operation, files)
-        elif kind == "link.add":
+        elif kind in {"link.add", "link.update", "link.delete"}:
+            current_link = None
+            if kind != "link.add":
+                current_link = next((item for item in page.get_links()
+                                     if item.get("xref") == operation.get("source_xref")), None)
+                if not current_link:
+                    raise ValueError("The selected link no longer exists")
+            if kind == "link.delete":
+                page.delete_link(current_link)
+                return
             uri = operation.get("uri")
             if uri:
                 parsed = urlparse(uri)
                 if parsed.scheme not in {"http", "https", "mailto"}: raise ValueError("Only HTTP(S) and mail links are allowed")
-                page.insert_link({"kind": fitz.LINK_URI, "from": rectangle, "uri": uri})
+                link = {"kind": fitz.LINK_URI,
+                        "from": rectangle or fitz.Rect(current_link["from"]), "uri": uri}
             else:
                 target = self._page_index(document, operation.get("target_page"))
-                page.insert_link({"kind": fitz.LINK_GOTO, "from": rectangle, "page": target})
+                link = {"kind": fitz.LINK_GOTO,
+                        "from": rectangle or fitz.Rect(current_link["from"]), "page": target}
+            if kind == "link.add":
+                page.insert_link(link)
+            else:
+                link["xref"] = current_link["xref"]
+                page.update_link(link)
         elif kind.startswith("form."):
             self._form(document, page, kind, rectangle, operation)
         else:
@@ -297,28 +336,44 @@ class PdfEditorEngine:
                           creating: bool = False) -> None:
         if operation.get("field_name"):
             widget.field_name = operation["field_name"]
-        widget.field_label = operation.get("field_label") or widget.field_label or widget.field_name
+        if creating or "field_label" in operation:
+            widget.field_label = operation.get("field_label") or widget.field_label or widget.field_name
         value = operation.get("field_value", operation.get("text"))
         if value is not None and widget.field_type != fitz.PDF_WIDGET_TYPE_SIGNATURE:
             widget.field_value = value
-        widget.text_font = operation.get("font") or widget.text_font or "Helv"
-        widget.text_fontsize = float(operation.get("font_size") or widget.text_fontsize or 11)
-        widget.text_color = color(operation.get("color", "#000000"))
-        widget.fill_color = color(operation["fill"]) if operation.get("fill") else widget.fill_color
-        widget.border_color = color(operation.get("color", "#000000"))
-        widget.border_width = float(operation.get("width", 1))
-        widget.border_style = {"solid": "S", "dashed": "D", "beveled": "B", "inset": "I", "underline": "U"}.get(operation.get("border_style"), "S")
-        widget.text_format = {"left": 0, "center": 1, "right": 2}.get(operation.get("alignment"), 0)
-        widget.field_display = 1 if operation.get("hidden") else (2 if not operation.get("printable", True) else 0)
+        if creating or "font" in operation:
+            widget.text_font = operation.get("font") or widget.text_font or "Helv"
+        if creating or "font_size" in operation:
+            widget.text_fontsize = float(operation.get("font_size") or widget.text_fontsize or 11)
+        if creating or "color" in operation:
+            widget.text_color = color(operation.get("color", "#000000"))
+            widget.border_color = color(operation.get("color", "#000000"))
+        if operation.get("fill"):
+            widget.fill_color = color(operation["fill"])
+        if creating or "width" in operation:
+            widget.border_width = float(operation.get("width", 1))
+        if creating or "border_style" in operation:
+            widget.border_style = {"solid": "S", "dashed": "D", "beveled": "B", "inset": "I", "underline": "U"}.get(operation.get("border_style"), "S")
+        if creating or "alignment" in operation:
+            widget.text_format = {"left": 0, "center": 1, "right": 2}.get(operation.get("alignment"), 0)
+        if creating or "hidden" in operation or "printable" in operation:
+            widget.field_display = 1 if operation.get("hidden") else (2 if not operation.get("printable", True) else 0)
         flags = int(widget.field_flags or 0)
-        flags = flags | fitz.PDF_FIELD_IS_REQUIRED if operation.get("required") else flags & ~fitz.PDF_FIELD_IS_REQUIRED
-        flags = flags | fitz.PDF_FIELD_IS_READ_ONLY if operation.get("readonly") else flags & ~fitz.PDF_FIELD_IS_READ_ONLY
+        if creating or "required" in operation:
+            flags = flags | fitz.PDF_FIELD_IS_REQUIRED if operation.get("required") else flags & ~fitz.PDF_FIELD_IS_REQUIRED
+        if creating or "readonly" in operation:
+            flags = flags | fitz.PDF_FIELD_IS_READ_ONLY if operation.get("readonly") else flags & ~fitz.PDF_FIELD_IS_READ_ONLY
         if widget.field_type == fitz.PDF_WIDGET_TYPE_TEXT:
-            flags = flags | 4096 if operation.get("multiline") else flags & ~4096
-            flags = flags | 8192 if operation.get("password") else flags & ~8192
-            flags = flags | 8388608 if operation.get("no_scroll") else flags & ~8388608
-            flags = flags | 16777216 if operation.get("comb") else flags & ~16777216
-            widget.text_maxlen = int(operation.get("max_length") or 0)
+            if creating or "multiline" in operation:
+                flags = flags | 4096 if operation.get("multiline") else flags & ~4096
+            if creating or "password" in operation:
+                flags = flags | 8192 if operation.get("password") else flags & ~8192
+            if creating or "no_scroll" in operation:
+                flags = flags | 8388608 if operation.get("no_scroll") else flags & ~8388608
+            if creating or "comb" in operation:
+                flags = flags | 16777216 if operation.get("comb") else flags & ~16777216
+            if creating or "max_length" in operation:
+                widget.text_maxlen = int(operation.get("max_length") or 0)
         if widget.field_type == fitz.PDF_WIDGET_TYPE_BUTTON:
             flags |= 65536
             widget.button_caption = operation.get("field_label") or operation.get("text") or widget.field_name
@@ -598,6 +653,56 @@ class PdfEditorEngine:
         if remaining < 0:
             raise ValueError("Edited text overflows its object bounds; choose expand-box or manual layout")
 
+    def _edit_text_block(self, page: fitz.Page, rectangle: fitz.Rect, operation: dict) -> None:
+        """Replace and reflow a complete native PDF text block.
+
+        PDF files do not store paragraphs as word-processing objects. The
+        authoritative block bounds from the page text scene are therefore
+        reconstructed as one multiline textbox after the original glyphs are
+        securely removed.
+        """
+        original = operation["text"]
+        start, end = int(operation["range_start"]), int(operation["range_end"])
+        if start < 0 or end < start or end > len(original):
+            raise ValueError("The paragraph edit range no longer matches its source block")
+        rebuilt = original[:start] + operation.get("replacement", "") + original[end:]
+        page.add_redact_annot(rectangle, fill=False, cross_out=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                              graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                              text=fitz.PDF_REDACT_TEXT_REMOVE)
+        if not rebuilt:
+            return
+
+        resource = operation.get("font_resource")
+        if resource and operation.get("font_policy") != "substitute":
+            fontname = resource if str(resource).startswith("/") else f"/{resource}"
+            fontfile = None
+        else:
+            fontname, fontfile = resolve_font(str(operation.get("font", "Helvetica")))
+        arguments = {
+            "fontname": fontname,
+            "fontfile": fontfile,
+            "color": color(operation.get("color", "#000000")),
+            "fill_opacity": float(operation.get("opacity", 1)),
+            "overlay": True,
+        }
+        edit_rect = fitz.Rect(rectangle)
+        policy = operation.get("reflow_policy", "reduce_font")
+        if policy == "expand_box":
+            edit_rect.x1 = max(edit_rect.x1, page.rect.x1 - 12)
+            edit_rect.y1 = max(edit_rect.y1, min(page.rect.y1 - 12,
+                                                edit_rect.y0 + max(edit_rect.height * 2, 72)))
+
+        initial_size = float(operation.get("font_size", 12))
+        sizes = [initial_size]
+        if policy in {"reduce_font", "preserve_line_positions"}:
+            sizes.extend(size / 2 for size in range(int(initial_size * 2) - 1, 7, -1))
+        for size in sizes:
+            remaining = page.insert_textbox(edit_rect, rebuilt, fontsize=size, **arguments)
+            if remaining >= 0:
+                return
+        raise ValueError("Edited paragraph does not fit its text box; shorten it or choose expand-box reflow")
+
     def _edit_image_object(self, document: fitz.Document, page: fitz.Page,
                            operation: dict, files: dict[str, str]) -> None:
         source_rect = fitz.Rect(operation["source_rect"])
@@ -800,6 +905,14 @@ class PdfEditorEngine:
         return index
 
 
+def _operation_error(index: int, operation: dict, exc: Exception) -> str:
+    kind = str(operation.get("kind", "unknown")).replace(".", " ")
+    page = operation.get("page")
+    location = f" on page {page}" if page else ""
+    message = str(exc) or exc.__class__.__name__
+    return f"Edit {index} ({kind}){location} failed: {message}"
+
+
 def color(value: str) -> tuple[float, float, float]:
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", value): raise ValueError("Invalid PDF color")
     return tuple(int(value[index:index + 2], 16) / 255 for index in (1, 3, 5))
@@ -851,6 +964,20 @@ def resolve_font(requested: str) -> tuple[str, str | None]:
     normalized = requested.strip().lower()
     if normalized in builtins: return builtins[normalized], None
     if not re.fullmatch(r"[\w .,+-]{1,120}", requested): raise ValueError("Font family name contains unsupported characters")
+    family_file = requested.split("+", 1)[-1].replace(" ", "")
+    internal_roots = [
+        Path(os.environ.get("INTERNAL_FONT_PATH", "./data/fonts")),
+        Path(__file__).resolve().parents[1] / "assets" / "fonts",
+    ]
+    windows_roots = [
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts",
+    ]
+    for root in [*internal_roots, *windows_roots]:
+        for extension in (".ttf", ".otf", ".ttc"):
+            candidate = root / f"{family_file}{extension}"
+            if candidate.is_file():
+                return "cvfont", str(candidate)
     if not shutil.which("fc-match"): raise ValueError(f"Font '{requested}' is not installed")
     result = subprocess.run(["fc-match", "--format", "%{file}", requested], capture_output=True, text=True, timeout=10, check=True)
     fontfile = result.stdout.strip()
@@ -858,11 +985,34 @@ def resolve_font(requested: str) -> tuple[str, str | None]:
     return "cvfont", fontfile
 
 
+def available_font_families() -> list[str]:
+    families = {"Helvetica", "Times", "Courier"}
+    roots = [
+        Path(os.environ.get("INTERNAL_FONT_PATH", "./data/fonts")),
+        Path(__file__).resolve().parents[1] / "assets" / "fonts",
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts",
+    ]
+    for root in roots:
+        if root.is_dir():
+            for extension in ("*.ttf", "*.otf", "*.ttc"):
+                families.update(path.stem for path in root.rglob(extension))
+    if shutil.which("fc-list"):
+        try:
+            result = subprocess.run(["fc-list", "--format", "%{family}\n"], capture_output=True,
+                                    text=True, timeout=15, check=True)
+            families.update(name.strip() for line in result.stdout.splitlines()
+                            for name in line.split(",") if name.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return sorted(families, key=str.casefold)[:2000]
+
+
 def validate_edited_pdf(source: Path, output: Path, operations: list[dict]) -> dict:
     """Validate structure, expected edits, rendering, and untouched-page fidelity."""
     if not output.exists() or output.stat().st_size == 0:
         raise RuntimeError("Edited PDF validation failed: the output is empty")
-    structural = any(operation["kind"] in {"page.reorder", "page.delete", "page.insert_blank",
+    structural = any(operation["kind"] in {"page.reorder", "page.delete", "page.duplicate", "page.insert_blank",
                                                    "page.insert_from_pdf", "page.replace_from_pdf"}
                      for operation in operations)
     global_change = any(operation["kind"] in {"watermark.text", "header_footer", "metadata.set"}
@@ -881,7 +1031,7 @@ def validate_edited_pdf(source: Path, output: Path, operations: list[dict]) -> d
                 changed_pages.add(int(operation["page"]))
             changed_pages.update(int(page) for page in operation.get("pages", []))
             if kind == "page.delete": expected_pages -= len(set(operation["pages"]))
-            if kind in {"page.insert_blank", "page.insert_from_pdf"}: expected_pages += 1
+            if kind in {"page.duplicate", "page.insert_blank", "page.insert_from_pdf"}: expected_pages += 1
             if kind in {"page.reorder", "watermark.text", "header_footer", "metadata.set"}:
                 changed_pages.update(range(1, edited.page_count + 1))
         if edited.page_count != expected_pages:
@@ -898,7 +1048,7 @@ def validate_edited_pdf(source: Path, output: Path, operations: list[dict]) -> d
                 page.get_fonts(full=True)
             except Exception as exc:
                 errors.append(f"Page {page_number} did not render or parse: {str(exc)[:160]}")
-        for operation in operations:
+        for operation_index, operation in enumerate(operations):
             page_number = operation.get("page")
             if operation["kind"] == "redact.search":
                 selected = operation.get("pages") or list(range(1, edited.page_count + 1))
@@ -921,23 +1071,44 @@ def validate_edited_pdf(source: Path, output: Path, operations: list[dict]) -> d
                                          "form_values_removed": bool(operation.get("remove_form_values"))})
             if not page_number or page_number > edited.page_count:
                 continue
-            page_text = edited[page_number - 1].get_text("text")
+            edited_page = edited[page_number - 1]
+            page_text = edited_page.get_text("text")
+            validation_rect = fitz.Rect(operation["rect"]) if operation.get("rect") else None
+            if validation_rect and operation["kind"] == "content.edit_text_object":
+                padding = float(operation.get("font_size", 12))
+                validation_rect.x1 = edited_page.rect.x1
+                validation_rect.y0 = max(edited_page.rect.y0, validation_rect.y0 - padding)
+                validation_rect.y1 = min(edited_page.rect.y1, validation_rect.y1 + padding)
+            elif validation_rect:
+                validation_rect = validation_rect + (-2, -2, 2, 2)
+            operation_text = edited_page.get_textbox(validation_rect) if validation_rect else page_text
             if operation["kind"] == "content.replace_text":
-                if operation["text"] in page_text:
+                if operation["text"] in operation_text:
                     errors.append(f"Replaced source text remains extractable on page {page_number}")
                 replacement = operation.get("replacement", "")
-                if replacement and replacement not in page_text:
+                if replacement and replacement not in operation_text:
                     errors.append(f"Replacement text is not extractable on page {page_number}")
-            if operation["kind"] == "content.edit_text_object":
+            if operation["kind"] in {"content.edit_text_object", "content.edit_text_block"}:
                 original_text = operation["text"]
                 start, end = int(operation["range_start"]), int(operation["range_end"])
                 rebuilt = original_text[:start] + operation.get("replacement", "") + original_text[end:]
-                if original_text != rebuilt and original_text in page_text:
+                if original_text != rebuilt and original_text in operation_text:
                     errors.append(f"The original native text object remains extractable on page {page_number}")
-                if rebuilt and rebuilt not in page_text:
+                normalized_rebuilt = " ".join(rebuilt.split())
+                normalized_region = " ".join(operation_text.split())
+                if normalized_rebuilt and normalized_rebuilt not in normalized_region:
                     errors.append(f"The edited native text object is not extractable on page {page_number}")
-            if operation["kind"] == "content.add_text" and operation.get("text") not in page_text:
-                errors.append(f"Added text is not extractable on page {page_number}")
+            if operation["kind"] == "content.add_text":
+                source_rect = fitz.Rect(operation["rect"])
+                superseded = any(
+                    later.get("page") == page_number and later.get("rect")
+                    and fitz.Rect(later["rect"]).intersects(source_rect)
+                    and later.get("kind") in {"content.edit_text_object", "content.edit_text_block",
+                                               "content.replace_text", "redact", "redact.search"}
+                    for later in operations[operation_index + 1:]
+                )
+                if not superseded and operation.get("text") not in operation_text:
+                    errors.append(f"Added text is not extractable on page {page_number}")
             if operation["kind"] in {"page.insert_from_pdf", "page.replace_from_pdf"}:
                 sample = operation.get("text")
                 if sample and sample not in page_text:

@@ -106,15 +106,27 @@ def build_page_scene(path: Path, session_id: str, page_number: int) -> dict:
         page = document[page_number - 1]
         content_streams = list(page.get_contents())
         fonts = _font_catalog(page)
-        font_by_name = {font["base_font"]: font for font in fonts}
+        font_by_name: dict[str, dict] = {}
+        for font in fonts:
+            base_name = str(font["base_font"])
+            font_by_name[base_name] = font
+            # Text spans omit the six-letter PDF subset prefix while the page
+            # font catalog retains it (for example ABCDEF+DejaVuSans).
+            font_by_name[base_name.split("+", 1)[-1]] = font
         objects: list[dict] = []
 
         raw = page.get_text("rawdict", flags=fitz.TEXTFLAGS_RAWDICT)
         text_ordinal = 0
+        paragraph_objects: list[dict] = []
+        paragraph_ordinal = 0
         for block in raw.get("blocks", []):
             if block.get("type") != 0:
                 continue
+            paragraph_lines: list[str] = []
+            paragraph_styles: list[dict] = []
+            paragraph_levels: list[str] = []
             for line in block.get("lines", []):
+                line_text: list[str] = []
                 for span in line.get("spans", []):
                     chars = [{
                         "unicode": char.get("c", ""),
@@ -129,6 +141,15 @@ def build_page_scene(path: Path, session_id: str, page_number: int) -> dict:
                     level = "Editable with reconstruction" if font.get("subset") else "Fully editable"
                     if font.get("subtype") == "Type3":
                         level = "Protected"
+                    paragraph_levels.append(level)
+                    paragraph_styles.append({
+                        "font": span.get("font"),
+                        "font_size": span.get("size"),
+                        "color": f"#{int(span.get('color', 0)) & 0xFFFFFF:06x}",
+                        "font_xref": font.get("xref"),
+                        "font_resource": font.get("resource_name"),
+                    })
+                    line_text.append(text)
                     signature = f"{page.xref}:{font.get('resource_name')}:{text_ordinal}"
                     objects.append({
                         "id": _stable_id(session_id, page_number, "text", text_ordinal, signature),
@@ -165,6 +186,41 @@ def build_page_scene(path: Path, session_id: str, page_number: int) -> dict:
                             "font_resource": font.get("resource_name"),
                         },
                     })
+                if line_text:
+                    paragraph_lines.append("".join(line_text))
+            paragraph_text = "\n".join(paragraph_lines)
+            if paragraph_text:
+                paragraph_ordinal += 1
+                level = ("Protected" if "Protected" in paragraph_levels
+                         else "Editable with reconstruction" if "Editable with reconstruction" in paragraph_levels
+                         else "Fully editable")
+                first_style = paragraph_styles[0] if paragraph_styles else {}
+                signature = f"{page.xref}:paragraph:{paragraph_ordinal}:{block.get('number', paragraph_ordinal)}"
+                paragraph_objects.append({
+                    "id": _stable_id(session_id, page_number, "paragraph", paragraph_ordinal, signature),
+                    "type": "text_block",
+                    "page": page_number,
+                    "bounds": _json_value(block.get("bbox")),
+                    "transform": [1, 0, 0, 1, *_json_value(block.get("bbox"))[:2]],
+                    "z_order": len(objects),
+                    "opacity": 1,
+                    "blend_mode": "Normal",
+                    "clipping": None,
+                    "source": {"content_streams": content_streams},
+                    "editability": level,
+                    "lock_state": level == "Protected",
+                    "visibility": True,
+                    "parent_group": None,
+                    "appearance_state": "normal",
+                    "text": paragraph_text,
+                    "style": first_style,
+                    "line_count": len(paragraph_lines),
+                })
+
+        # Paragraphs are separate semantic editing targets. They follow the
+        # native spans in the scene so clients can expose either precision or
+        # reflow editing without losing the original run information.
+        objects.extend(paragraph_objects)
 
         for ordinal, image in enumerate(page.get_image_info(hashes=True, xrefs=True), 1):
             signature = f"{page.xref}:{image.get('xref')}:{_json_value(image.get('digest'))}:{ordinal}"

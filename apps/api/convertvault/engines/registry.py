@@ -1,11 +1,11 @@
 from .base import Capability, ConversionEngine
 from .image import PillowEngine
-from .pdf import OcrEngine, PdfEngine
+from .pdf import OcrEngine, PdfEngine, TesseractPdfOcrEngine
 from .pdf_editor import PdfEditorEngine
 from .subprocess_engine import LibreOfficeEngine, PandocEngine
 from .text import TextExtractionEngine
 
-ENGINES: list[ConversionEngine] = [PillowEngine(), PdfEngine(), PdfEditorEngine(), OcrEngine(), TextExtractionEngine(), LibreOfficeEngine(), PandocEngine()]
+ENGINES: list[ConversionEngine] = [PillowEngine(), PdfEngine(), PdfEditorEngine(), OcrEngine(), TesseractPdfOcrEngine(), TextExtractionEngine(), LibreOfficeEngine(), PandocEngine()]
 
 
 def capabilities() -> list[dict]:
