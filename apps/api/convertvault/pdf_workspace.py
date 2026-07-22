@@ -2,6 +2,7 @@ import csv
 import io
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -27,7 +28,7 @@ from .models import (
 from .pdf_scene import build_page_scene, interpret_document
 from .pdf_compare import compare_pdfs
 from .engines.base import ConversionContext
-from .engines.pdf_editor import PdfEditorEngine
+from .engines.pdf_editor import PdfEditorEngine, resolve_font
 from .schemas import (PdfAnnotationReplyRequest, PdfAnnotationUpdateRequest, PdfCompareRequest, PdfFormDataImportRequest,
                       PdfCommandCreate, PdfDocumentCreate, PdfEditOperation, PdfHistoryAction,
                       PdfImageObjectEditRequest, PdfNativeTextEditRequest, PdfSessionCreate,
@@ -156,12 +157,13 @@ def _source_for_session(session: PdfEditSession, user: User, db: Session) -> Sto
 
 
 def _materialize_session(session: PdfEditSession, user: User, db: Session,
-                         root: Path) -> Path:
+                         root: Path, operations: list[dict] | None = None) -> Path:
+    resolved = session.operations if operations is None else operations
     source = _source_for_session(session, user, db)
     source_path, edited_path = root / "source.pdf", root / "session.pdf"
     get_storage().copy_to(source.storage_key, source_path)
     assets: dict[str, str] = {}
-    for file_id in {file_id for item in session.operations
+    for file_id in {file_id for item in resolved
                     for file_id in (item.get("image_file_id"), item.get("source_file_id"),
                                     item.get("attachment_file_id")) if file_id}:
         asset = db.get(StoredFile, file_id)
@@ -173,11 +175,25 @@ def _materialize_session(session: PdfEditSession, user: User, db: Session,
     try:
         PdfEditorEngine().convert(ConversionContext(
             source_path, edited_path, "pdf", "pdf",
-            {"operations": session.operations, "_additional_file_map": assets},
+            {"operations": resolved, "_additional_file_map": assets},
         ))
-    except (ValueError, RuntimeError) as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - every engine fault must surface as an edit error
         raise HTTPException(422, f"The live PDF workspace could not be materialized: {exc}") from exc
     return edited_path
+
+
+def _validate_operations(session: PdfEditSession, user: User, db: Session,
+                         operations: list[dict]) -> None:
+    """Dry-run an operation list through the real engine before it is stored.
+
+    This is the safety gate that keeps a session healthy forever: a command
+    that cannot be applied is rejected here with the engine's actionable
+    message and never enters the recoverable history.
+    """
+    with tempfile.TemporaryDirectory(prefix="cv-pdf-validate-") as directory:
+        _materialize_session(session, user, db, Path(directory), operations=operations)
 
 
 def _missing_glyphs(path: Path, font_xref: int | None, font_name: str | None, value: str) -> list[str]:
@@ -459,7 +475,24 @@ def create_session(document_id: str, payload: PdfSessionCreate, user: User = Dep
         raise HTTPException(409, "This PDF document has no usable version")
     session = PdfEditSession(document_id=document.id, owner_id=user.id, base_version_id=version.id,
                              status="active", revision=0, cursor=0, operations=[])
-    db.add(session); db.flush(); _snapshot_if_due(session, db, force=True)
+    db.add(session); db.flush()
+    seed_operations = [operation.model_dump(exclude_none=True, exclude_unset=True)
+                       for operation in payload.operations]
+    if seed_operations:
+        _validate_operations(session, user, db, seed_operations)
+        for sequence, (operation_model, operation) in enumerate(zip(payload.operations, seed_operations), 1):
+            db.add(PdfEditorCommand(
+                session_id=session.id, sequence=sequence,
+                idempotency_key=f"seed-{sequence}-{uuid.uuid4()}",
+                command=operation_model.kind, page=operation_model.page,
+                object_id=operation_model.object_id, payload=operation,
+                before_state={"revision": sequence - 1, "cursor": sequence - 1},
+                after_state={"operation": operation}, status="applied", created_by=user.id,
+            ))
+        session.operations = seed_operations
+        session.cursor = len(seed_operations)
+        session.revision = len(seed_operations)
+    _snapshot_if_due(session, db, force=True)
     db.add(AuditLog(actor_id=user.id, action="pdf.session.create", object_type="pdf_session",
                     object_id=session.id, details={"document_id": document.id, "base_version_id": version.id}))
     db.commit(); db.refresh(session)
@@ -594,9 +627,15 @@ def edit_native_text(session_id: str, object_id: str, payload: PdfNativeTextEdit
             raise HTTPException(422, "Text editing was cancelled by the requested font policy")
         missing = _missing_glyphs(path, text_object["style"].get("font_xref"),
                                   text_object["style"].get("font"), payload.text)
+        effective_font = payload.replacement_font or text_object["style"].get("font") or "Helvetica"
+        effective_font_policy = payload.font_policy
         if missing and payload.font_policy == "preserve_or_prompt":
-            shown = " ".join(missing[:12])
-            raise HTTPException(422, f"The original font does not contain the required glyphs: {shown}. Select a replacement font to continue.")
+            try:
+                resolve_font(effective_font)
+                effective_font_policy = "substitute"
+            except ValueError:
+                shown = " ".join(missing[:12])
+                raise HTTPException(422, f"The original font does not contain the required glyphs: {shown}. Install the matching full font family or select it explicitly to continue.")
         if payload.font_policy == "substitute" and not payload.replacement_font:
             raise HTTPException(422, "Select a replacement font before using font substitution")
         operation = PdfEditOperation.model_validate({
@@ -609,13 +648,88 @@ def edit_native_text(session_id: str, object_id: str, payload: PdfNativeTextEdit
             "replacement": payload.text,
             "range_start": payload.range.start,
             "range_end": payload.range.end,
-            "font": payload.replacement_font or text_object["style"].get("font") or "Helvetica",
+            "font": effective_font,
             "font_size": text_object["style"].get("font_size") or 12,
             "color": text_object["style"].get("color") or "#000000",
             "font_resource": text_object["style"].get("font_resource"),
             "font_xref": text_object["style"].get("font_xref"),
             "reflow_policy": payload.reflow_policy,
-            "font_policy": payload.font_policy,
+            "font_policy": effective_font_policy,
+        })
+    return apply_command(session_id, PdfCommandCreate(
+        expected_revision=payload.expected_revision,
+        idempotency_key=payload.idempotency_key,
+        operation=operation,
+        object_id=object_id,
+    ), user, db)
+
+
+@router.patch("/sessions/{session_id}/paragraphs/{object_id}")
+def edit_native_paragraph(session_id: str, object_id: str, payload: PdfNativeTextEditRequest,
+                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Replace a complete PDF text block and reflow it inside its page bounds."""
+    session = _owned_session(session_id, user, db)
+    existing = db.scalar(select(PdfEditorCommand).where(
+        PdfEditorCommand.session_id == session.id,
+        PdfEditorCommand.idempotency_key == payload.idempotency_key,
+    ))
+    if existing:
+        return {"command": _command_json(existing), "session": _session_json(session),
+                "idempotent_replay": True}
+    if session.revision != payload.expected_revision:
+        raise HTTPException(409, {"message": "The PDF session changed in another client",
+                                  "current_revision": session.revision})
+    with tempfile.TemporaryDirectory(prefix="cv-pdf-native-paragraph-") as directory:
+        path = _materialize_session(session, user, db, Path(directory))
+        paragraph = None
+        with fitz.open(path) as document:
+            page_count = document.page_count
+        for page_number in range(1, page_count + 1):
+            scene = build_page_scene(path, session.id, page_number)
+            paragraph = next((item for item in scene["objects"]
+                              if item["id"] == object_id and item["type"] == "text_block"), None)
+            if paragraph:
+                break
+        if not paragraph:
+            raise HTTPException(404, "The selected paragraph no longer exists in this session")
+        if paragraph["editability"] == "Protected":
+            raise HTTPException(422, "This paragraph contains protected Type 3 glyphs and cannot be safely rewritten")
+        original = paragraph["text"]
+        if payload.range.end > len(original):
+            raise HTTPException(422, "The selected character range extends beyond the current paragraph")
+        if payload.font_policy == "cancel":
+            raise HTTPException(422, "Paragraph editing was cancelled by the requested font policy")
+        missing = _missing_glyphs(path, paragraph["style"].get("font_xref"),
+                                  paragraph["style"].get("font"), payload.text)
+        effective_font = payload.replacement_font or paragraph["style"].get("font") or "Helvetica"
+        effective_font_policy = payload.font_policy
+        if missing and payload.font_policy == "preserve_or_prompt":
+            try:
+                resolve_font(effective_font)
+                effective_font_policy = "substitute"
+            except ValueError:
+                shown = " ".join(missing[:12])
+                raise HTTPException(422, f"The original font does not contain the required glyphs: {shown}. Install the matching full font family or select it explicitly to continue.")
+        if payload.font_policy == "substitute" and not payload.replacement_font:
+            raise HTTPException(422, "Select a replacement font before using font substitution")
+        bounds = paragraph["bounds"]
+        operation = PdfEditOperation.model_validate({
+            "kind": "content.edit_text_block",
+            "page": paragraph["page"],
+            "object_id": object_id,
+            "rect": bounds,
+            "origin": bounds[:2],
+            "text": original,
+            "replacement": payload.text,
+            "range_start": payload.range.start,
+            "range_end": payload.range.end,
+            "font": effective_font,
+            "font_size": paragraph["style"].get("font_size") or 12,
+            "color": paragraph["style"].get("color") or "#000000",
+            "font_resource": paragraph["style"].get("font_resource"),
+            "font_xref": paragraph["style"].get("font_xref"),
+            "reflow_policy": payload.reflow_policy,
+            "font_policy": effective_font_policy,
         })
     return apply_command(session_id, PdfCommandCreate(
         expected_revision=payload.expected_revision,
@@ -1005,11 +1119,13 @@ def apply_command(session_id: str, payload: PdfCommandCreate, user: User = Depen
     if session.revision != payload.expected_revision:
         raise HTTPException(409, {"message": "The PDF session changed in another client",
                                   "current_revision": session.revision})
+    operation = payload.operation.model_dump(exclude_none=True, exclude_unset=True)
+    candidate_operations = [*session.operations, operation]
+    _validate_operations(session, user, db, candidate_operations)
     undone = db.scalars(select(PdfEditorCommand).where(PdfEditorCommand.session_id == session.id,
                                                        PdfEditorCommand.status == "undone")).all()
     for command in undone:
         command.status = "superseded"
-    operation = payload.operation.model_dump(exclude_none=True)
     command = PdfEditorCommand(
         session_id=session.id, sequence=_next_sequence(session.id, db),
         idempotency_key=payload.idempotency_key, command=payload.operation.kind,
@@ -1049,6 +1165,9 @@ def _history_action(session: PdfEditSession, payload: PdfHistoryAction, user: Us
         raise HTTPException(409, f"There is nothing to {action}")
     before = target.status
     target.status = "undone" if action == "undo" else "applied"
+    db.flush()
+    candidate_operations = _active_operations(session.id, db)
+    _validate_operations(session, user, db, candidate_operations)
     history = PdfEditorCommand(
         session_id=session.id, sequence=_next_sequence(session.id, db),
         idempotency_key=payload.idempotency_key, command=f"history.{action}",

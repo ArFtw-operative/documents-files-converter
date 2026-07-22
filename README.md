@@ -8,7 +8,7 @@ ConvertVault is a private, self-hosted file conversion service and document libr
 - Streamed multi-file uploads and downloads, filename sanitization, quota enforcement, SHA-256 checksums, search, Trash, restore, and derivative lineage.
 - Durable queue-separated jobs, real database progress, cancellation checkpoints, job history, useful safe errors, and authenticated server-sent progress events.
 - Pillow/pillow-heif image conversion (JPEG, PNG, WebP, GIF, TIFF, BMP, ICO, HEIC/HEIF where available), resize, rotation, metadata controls, transparency backgrounds, and quality settings.
-- PDF Studio with persistent non-destructive projects, optimistic revision history, authenticated page previews, page reordering/deletion/insertion/rotation/cropping, existing-text inspection and replacement, new text and graphics, freehand drawing, true redaction, annotations, links, form fields, images, visual signatures, watermarks, headers/footers, metadata, and validated background export.
+- PDF Studio with persistent non-destructive projects, optimistic revision history, authenticated page previews, page reordering/deletion/duplication/insertion/rotation/cropping, one-click inline paragraph editing with font detection and reflow, live text and shape creation, link create/update/delete, freehand drawing, true redaction, annotations, form fields, images, visual signatures, watermarks, headers/footers, metadata, and validated background export.
 - A broader PDF suite for merge/split, page extraction, rendering, image extraction, compression presets, metadata removal, AES-256 encryption/decryption, page numbering, form/annotation flattening, structural repair, active-content sanitization, and OCR when OCRmyPDF is installed.
 - Local structured text extraction from PDF, DOCX, ODT, RTF, text/Markdown/HTML, CSV/TSV/XLSX, PPTX, EPUB, and common image formats. It preserves source wording, normalizes reading order and paragraph whitespace, and uses Tesseract OCR where needed.
 - Capability-detected LibreOffice office conversions and Pandoc markup conversions inside workers with isolated temporary directories and timeouts.
@@ -55,7 +55,7 @@ npm --prefix apps/web run build
 docker compose config --quiet
 ```
 
-This checkout passed 25 Python tests—including a complete authenticated PDF Studio export flow—and a Next.js production build. Docker was unavailable on the development host, so Compose startup still needs verification on a Docker host. See [architecture](docs/architecture.md), [security](docs/security.md), [supported formats](docs/supported-formats.md), [administration](docs/administrator-guide.md), and [limitations](docs/known-limitations.md).
+This checkout passed 45 Python tests—including a complete authenticated PDF Studio export flow—and a Next.js production build with TypeScript validation. A real 31-page PDF was edited, saved, exported, strictly parsed, rendered, and inspected for preserved text, fonts, links, and a form field. Docker is not installed on the development host, so Compose image startup still needs verification on a Docker host. See [PDF Studio acceptance evidence](docs/pdf-studio-acceptance.md), [architecture](docs/architecture.md), [security](docs/security.md), [supported formats](docs/supported-formats.md), [administration](docs/administrator-guide.md), and [limitations](docs/known-limitations.md).
 
 ## Resource starting point
 

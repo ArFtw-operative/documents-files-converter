@@ -74,10 +74,10 @@ class JobCreate(BaseModel):
 
 class PdfEditOperation(BaseModel):
     kind: Literal[
-        "page.reorder", "page.delete", "page.rotate", "page.crop", "page.insert_blank",
+        "page.reorder", "page.delete", "page.duplicate", "page.rotate", "page.crop", "page.insert_blank",
         "page.insert_from_pdf", "page.replace_from_pdf", "page.resize", "page.set_boxes",
         "content.add_text", "content.add_image", "content.add_shape", "content.draw",
-        "content.replace_text", "content.edit_text_object",
+        "content.replace_text", "content.edit_text_object", "content.edit_text_block",
         "content.transform_image", "content.replace_image_object", "content.delete_image_object",
         "content.transform_vector", "content.delete_vector_object",
         "redact", "redact.search", "annotate.highlight", "annotate.underline", "annotate.squiggly",
@@ -85,7 +85,7 @@ class PdfEditOperation(BaseModel):
         "annotate.ink", "annotate.line", "annotate.arrow", "annotate.rectangle", "annotate.ellipse",
         "annotate.polygon", "annotate.polyline", "annotate.stamp", "annotate.attachment",
         "annotate.caret", "annotate.replace_text", "annotate.redaction_mark", "annotate.measurement",
-        "annotate.update", "annotate.reply", "annotate.delete", "link.add",
+        "annotate.update", "annotate.reply", "annotate.delete", "link.add", "link.update", "link.delete",
         "form.text", "form.multiline", "form.checkbox", "form.radio", "form.combo",
         "form.listbox", "form.pushbutton", "form.signature", "form.date", "form.numeric",
         "form.update", "form.delete", "form.reset", "form.flatten", "form.import_data",
@@ -183,10 +183,10 @@ class PdfEditOperation(BaseModel):
 
     @model_validator(mode="after")
     def validate_for_kind(self):
-        page_kinds = {"page.rotate", "page.crop", "page.replace_from_pdf", "page.resize", "page.set_boxes",
+        page_kinds = {"page.duplicate", "page.rotate", "page.crop", "page.replace_from_pdf", "page.resize", "page.set_boxes",
                       "content.add_text", "content.add_image",
                       "content.add_shape", "content.draw", "content.replace_text", "redact",
-                      "content.edit_text_object", "content.transform_image", "content.replace_image_object",
+                      "content.edit_text_object", "content.edit_text_block", "content.transform_image", "content.replace_image_object",
                       "content.delete_image_object", "content.transform_vector", "content.delete_vector_object",
                       "annotate.highlight", "annotate.underline", "annotate.squiggly", "annotate.strikeout",
                       "annotate.comment", "annotate.free_text", "annotate.callout", "annotate.ink",
@@ -194,13 +194,13 @@ class PdfEditOperation(BaseModel):
                       "annotate.polygon", "annotate.polyline", "annotate.stamp", "annotate.attachment",
                       "annotate.caret", "annotate.replace_text", "annotate.redaction_mark",
                       "annotate.measurement", "annotate.update", "annotate.reply", "annotate.delete",
-                      "link.add", "form.text", "form.multiline", "form.checkbox", "form.radio",
+                      "link.add", "link.update", "link.delete", "form.text", "form.multiline", "form.checkbox", "form.radio",
                       "form.combo", "form.listbox", "form.pushbutton", "form.signature",
                       "form.date", "form.numeric", "form.update", "form.delete",
                       "signature.add"}
         if self.kind in page_kinds and not self.page: raise ValueError("This operation requires a page number")
         rect_kinds = {"page.crop", "content.add_text", "content.add_image", "content.add_shape",
-                      "content.edit_text_object", "redact", "annotate.highlight", "annotate.underline", "annotate.strikeout",
+                      "content.edit_text_object", "content.edit_text_block", "redact", "annotate.highlight", "annotate.underline", "annotate.strikeout",
                       "annotate.squiggly", "annotate.comment", "annotate.free_text", "annotate.callout",
                       "annotate.rectangle", "annotate.ellipse", "annotate.stamp", "annotate.attachment",
                       "annotate.caret", "annotate.replace_text", "annotate.redaction_mark", "annotate.measurement",
@@ -272,7 +272,11 @@ class PdfEditOperation(BaseModel):
             raise ValueError("Bookmark creation and updates require a title and destination page")
         if self.kind in {"bookmark.update", "bookmark.delete"} and self.bookmark_index is None:
             raise ValueError("Bookmark updates and deletion require a bookmark index")
-        if self.kind == "content.edit_text_object":
+        if self.kind in {"link.add", "link.update"} and not self.uri and not self.target_page:
+            raise ValueError("A link requires a web address or destination page")
+        if self.kind in {"link.update", "link.delete"} and not self.source_xref:
+            raise ValueError("Existing-link editing requires its PDF object reference")
+        if self.kind in {"content.edit_text_object", "content.edit_text_block"}:
             if not self.object_id or self.text is None or self.replacement is None or not self.origin:
                 raise ValueError("Native text editing requires a scene object, source text, replacement text, and baseline")
             if self.range_start is None or self.range_end is None or self.range_end < self.range_start:
@@ -307,6 +311,7 @@ class PdfDocumentCreate(BaseModel):
 
 class PdfSessionCreate(BaseModel):
     base_version_id: str | None = None
+    operations: list[PdfEditOperation] = Field(default_factory=list, max_length=5000)
 
 
 class PdfCommandCreate(BaseModel):

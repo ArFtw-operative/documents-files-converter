@@ -10,7 +10,7 @@
 | LibreOffice | Office conversion | MPL/LGPL | worker |
 | Pandoc | markup conversion | GPLv2+ | worker |
 | Tesseract, qpdf, Ghostscript | OCR/PDF tooling | Apache-2.0/Apache-2.0/AGPLv3 | worker |
+| Noto, Liberation, DejaVu fonts | Broad multilingual PDF text fallback | SIL OFL / GPL font exception / permissive font licences | API/worker container |
 | Next.js, React | web UI | MIT | web |
 
 Versions are pinned in requirements, package lock, Dockerfiles, and Compose. Operators redistributing images must review complete transitive license notices. Generate an SBOM with `docker sbom IMAGE` or Syft in CI; container/source licenses remain independent of ConvertVault's license.
-
