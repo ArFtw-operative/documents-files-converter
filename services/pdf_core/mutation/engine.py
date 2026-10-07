@@ -28,7 +28,8 @@ SUPPORTED_OPERATIONS = CONTENT_OPERATIONS | PAGE_OPERATIONS
 @dataclass
 class BatchResult:
     page_order: list[int | None]  # new index -> source index (None = inserted page)
-    changed_pages: set[int] = field(default_factory=set)  # source indices with content changes
+    changed_pages: set[int] = field(default_factory=set)  # source indices with any change
+    rotated_pages: set[int] = field(default_factory=set)  # source indices whose /Rotate changed
     outcomes: list[EditOutcome] = field(default_factory=list)
 
     @property
@@ -55,7 +56,7 @@ def _target(scene: PageScene, operation: dict):
 
 
 def apply_batch(source: Path, output: Path, operations: list[dict],
-                scene_for: Callable[[int], PageScene]) -> BatchResult:
+                scene_for: Callable[[int], PageScene], allow_signed: bool = False) -> BatchResult:
     for operation in operations:
         if operation.get("type") not in SUPPORTED_OPERATIONS:
             raise MutationError("unsupported_operation", f"Unsupported operation: {operation.get('type')}")
@@ -63,8 +64,9 @@ def apply_batch(source: Path, output: Path, operations: list[dict],
     try:
         if document.needs_pass:
             raise MutationError("encrypted", "Unlock this PDF before editing.")
-        if document.is_form_pdf and document.get_sigflags() > 0:
-            raise MutationError("signed_document", "This document is digitally signed.")
+        if document.get_sigflags() > 0 and not allow_signed:
+            raise MutationError("signed_document", "Editing will invalidate this document's digital "
+                                "signature. Confirm to continue; the signed original is preserved.")
         resolver = FontResolver(document)
         result = BatchResult(page_order=list(range(document.page_count)))
         content = [op for op in operations if op["type"] in CONTENT_OPERATIONS]
@@ -121,6 +123,7 @@ def _page_operation(document: fitz.Document, result: BatchResult, operation: dic
         source_index = result.page_order[index]
         if source_index is not None:
             result.changed_pages.add(source_index)
+            result.rotated_pages.add(source_index)
     elif kind == "delete_page":
         if count == 1:
             raise MutationError("invalid_payload", "A document must keep at least one page.")

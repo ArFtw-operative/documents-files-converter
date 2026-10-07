@@ -7,7 +7,13 @@ for path in (ROOT / "apps" / "api", ROOT / "services", ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import tempfile  # noqa: E402
+
+_RUNTIME = Path(tempfile.mkdtemp(prefix="folio-test-"))
 os.environ.setdefault("FOLIO_ENV", "test")
+os.environ.setdefault("FOLIO_DATABASE_URL", f"sqlite:///{_RUNTIME / 'folio.db'}")
+os.environ.setdefault("FOLIO_DATA_DIR", str(_RUNTIME / "storage"))
+os.environ.setdefault("FOLIO_ENGINE_MODE", "inline")
 
 import pytest  # noqa: E402
 
