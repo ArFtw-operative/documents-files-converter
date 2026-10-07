@@ -1,6 +1,7 @@
 # Verso Folio — Roadmap and Status
 
 Sequencing follows architecture §78 and §82–83, with the decisions in [decisions.md](decisions.md).
+Step-by-step history: [changelog.md](changelog.md).
 
 ## Milestone 1 — Foundation + native vertical slice ✅ (2026-10-07)
 
@@ -11,13 +12,13 @@ Covers Phase 0, Phase 1 and Phase 2, plus parts of Phase 3 and Phase 8.
 | Accounts (D2) | Cookie sessions + CSRF, Argon2, TOTP two-step sign-in, lockout, admin user management, quotas, strict per-user isolation, audit log with privacy mode |
 | Document model | Documents, stable pages, page versions, revisions, operation batches (idempotent), content-addressed storage with atomic writes |
 | Native analysis | PyMuPDF scene graph: logical runs (baseline clustering, style splits, fake-bold merge, synthetic spaces), glyph quads, alignment inference, images, vector clusters, annotations, links, page classification |
-| In-place editing | `replace_text` keeps the embedded font (subset cmap rebuilt), same-family fallback, per-glyph substitution with warning, preserve-box fitting (free space → tracking ±5% → scale ≥90% → size ≥90% → confirm), right/centre anchoring, rotated text, crop boxes, rotated pages; `add_text`, `delete_object` |
+| In-place editing | `replace_text` keeps the embedded font (subset cmap rebuilt), reuses non-embedded font resources (e.g. `CourierNew,Bold`), same-family fallback, per-glyph substitution with warning, preserve-box fitting (free space → tracking ±5% → scale ≥90% → size ≥90% → confirm), right/centre anchoring, rotated text, crop boxes, rotated pages; `add_text`, `delete_object` |
 | Pages | Rotate, delete, reorder, insert blank |
 | Integrity | Every revision: reopen, qpdf, render-diff outside the edited region, edited-text sanity check; failures keep the last good revision and store the artifact for diagnostics |
 | Undo/redo | Exact restoration by revision copy (byte-identical PDF, same object ids); restore any revision |
 | Editor UI | Vite/React/PDF.js, collapsed shell, thumbnails, contextual properties, floating toolbar, click-to-edit with caret placement, preview in the document's own font, optimistic preview, fit confirmation, find, Ctrl+K, shortcuts, diagnostics toggle, IndexedDB crash recovery, WebSocket events |
-| Deployment | Compose stack (`folio-*`), sandboxed CPU worker (no network, read-only, no capabilities), Alembic, backup script, `folio.local` enablement script |
-| Tests | 24 backend tests (SQLite and PostgreSQL), 7 coordinate-engine tests, Playwright browser vertical slice (dev and production stacks) |
+| Deployment | Compose stack (`folio-*`), sandboxed CPU worker (no network, read-only, no capabilities), Alembic, backup script; live at `https://folio.local` |
+| Tests | 26 backend tests (SQLite and PostgreSQL), 7 coordinate-engine tests, Playwright browser vertical slice (dev and production stacks) |
 
 ## Milestone 2 — Font fidelity, images, annotations (Phase 3 remainder + V1 scope)
 
