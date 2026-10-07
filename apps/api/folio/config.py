@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # "inline" runs the document engine in the API process (dev/test). "worker" dispatches every
     # PDF parse/mutation to the sandboxed CPU worker (production, architecture §44.2).
     engine_mode: Literal["inline", "worker"] = "inline"
-    engine_timeout_seconds: int = 60
+    engine_timeout_seconds: int = 180
 
     max_upload_bytes: int = 200 * 1024 * 1024
     max_pages: int = 2000

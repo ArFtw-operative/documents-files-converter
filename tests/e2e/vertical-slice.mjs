@@ -11,7 +11,8 @@ const PASSWORD = "correct horse battery";
 mkdirSync(OUT, { recursive: true });
 
 const browser = await chromium.launch();
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1,
+  ignoreHTTPSErrors: process.env.IGNORE_TLS === "1" });
 const page = await context.newPage();
 const problems = [];
 page.on("console", (m) => m.type() === "error" && problems.push(`console: ${m.text()}`));

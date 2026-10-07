@@ -14,8 +14,10 @@ from .services.errors import ServiceError
 settings = get_settings()
 logging.basicConfig(level=logging.INFO, format='{"level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}')
 
-app = FastAPI(title=settings.app_name, version=__version__, docs_url="/api/docs", openapi_url="/api/openapi.json",
-              redoc_url=None)
+_public_docs = settings.env != "production"
+app = FastAPI(title=settings.app_name, version=__version__, redoc_url=None,
+              docs_url="/api/docs" if _public_docs else None,
+              openapi_url="/api/openapi.json" if _public_docs else None)
 
 if settings.env != "production":
     # Production schema is managed by Alembic (`alembic upgrade head` in the migrate job).

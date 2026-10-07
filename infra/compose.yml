@@ -1,0 +1,123 @@
+# Verso Folio production stack (architecture §46). Run from the repository root:
+#   docker compose -f infra/compose.yml --env-file .env.folio up -d --build
+name: folio
+
+x-app-env: &app-env
+  FOLIO_ENV: production
+  FOLIO_PUBLIC_URL: ${FOLIO_PUBLIC_URL:-https://folio.local}
+  FOLIO_SECRET_KEY: ${FOLIO_SECRET_KEY:?set FOLIO_SECRET_KEY in .env.folio}
+  FOLIO_DATABASE_URL: postgresql+psycopg://folio:${FOLIO_DB_PASSWORD:?set FOLIO_DB_PASSWORD}@folio-db:5432/folio
+  FOLIO_VALKEY_URL: redis://folio-valkey:6379/0
+  FOLIO_DATA_DIR: /data/storage
+  FOLIO_ENGINE_MODE: worker
+  FOLIO_COOKIE_SECURE: "true"
+  FOLIO_MAX_UPLOAD_BYTES: ${FOLIO_MAX_UPLOAD_BYTES:-209715200}
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=512m"]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  restart: unless-stopped
+
+services:
+  folio-db:
+    image: postgres:17.6-alpine
+    container_name: folio-db
+    environment:
+      POSTGRES_DB: folio
+      POSTGRES_USER: folio
+      POSTGRES_PASSWORD: ${FOLIO_DB_PASSWORD}
+    volumes: [db:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U folio -d folio"], interval: 10s, timeout: 5s, retries: 10}
+    networks: [backend]
+    restart: unless-stopped
+    mem_limit: 1g
+    shm_size: 256m
+
+  folio-valkey:
+    image: valkey/valkey:8.1-alpine
+    container_name: folio-valkey
+    command: ["valkey-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction", "--save", "60", "100"]
+    volumes: [valkey:/data]
+    healthcheck: {test: ["CMD", "valkey-cli", "ping"], interval: 10s, timeout: 3s, retries: 10}
+    networks: [backend]
+    restart: unless-stopped
+    mem_limit: 512m
+
+  folio-migrate:
+    build: {context: .., dockerfile: infra/docker/api.Dockerfile, target: runtime}
+    image: folio-api:latest
+    container_name: folio-migrate
+    command: ["alembic", "-c", "apps/api/alembic.ini", "upgrade", "head"]
+    working_dir: /app
+    environment: *app-env
+    depends_on: {folio-db: {condition: service_healthy}}
+    networks: [backend]
+    restart: "no"
+
+  folio-api:
+    image: folio-api:latest
+    container_name: folio-api
+    environment: *app-env
+    volumes: [storage:/data/storage]
+    depends_on:
+      folio-migrate: {condition: service_completed_successfully}
+      folio-valkey: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [backend, edge]
+    mem_limit: 768m
+    <<: *hardening
+
+  # The only process that parses or writes PDFs (§7.2, §44.2): no outbound network (backend is
+  # internal), read-only root, no capabilities, bounded memory/CPU/PIDs.
+  folio-worker-cpu:
+    image: folio-api:latest
+    container_name: folio-worker-cpu
+    command: ["celery", "-A", "folio.worker:celery", "worker", "-Q", "pdf_mutation,analysis,export,maintenance",
+              "--concurrency", "${FOLIO_CPU_WORKERS:-2}", "--loglevel", "INFO", "-n", "cpu@%h"]
+    environment: *app-env
+    volumes: [storage:/data/storage]
+    depends_on:
+      folio-migrate: {condition: service_completed_successfully}
+      folio-valkey: {condition: service_healthy}
+    networks: [backend]
+    mem_limit: 2g
+    cpus: 4
+    pids_limit: 256
+    <<: *hardening
+
+  folio-scheduler:
+    image: folio-api:latest
+    container_name: folio-scheduler
+    command: ["celery", "-A", "folio.worker:celery", "beat", "--loglevel", "INFO", "--schedule", "/tmp/celerybeat-schedule"]
+    environment: *app-env
+    depends_on: {folio-valkey: {condition: service_healthy}}
+    networks: [backend]
+    mem_limit: 256m
+    <<: *hardening
+
+  folio-web:
+    build: {context: .., dockerfile: infra/docker/web.Dockerfile}
+    image: folio-web:latest
+    container_name: folio-web
+    networks: [edge]
+    mem_limit: 128m
+    <<: *hardening
+
+networks:
+  backend:
+    name: folio_backend
+    internal: true
+  edge:
+    name: atlas-proxy
+    external: true
+
+volumes:
+  db: {name: folio_db}
+  valkey: {name: folio_valkey}
+  storage: {name: folio_storage}

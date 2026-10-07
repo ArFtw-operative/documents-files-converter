@@ -7,7 +7,8 @@ RUN apt-get update \
       fonts-noto-core fonts-liberation2 fonts-dejavu-core fonts-urw-base35 \
  && rm -rf /var/lib/apt/lists/* \
  && fc-cache -f \
- && useradd --uid 10001 --create-home --shell /usr/sbin/nologin folio
+ && useradd --uid 10001 --create-home --shell /usr/sbin/nologin folio \
+ && mkdir -p /data/storage && chown -R folio:folio /data
 WORKDIR /app
 COPY apps/api/requirements.txt apps/api/requirements.txt
 RUN pip install -r apps/api/requirements.txt
