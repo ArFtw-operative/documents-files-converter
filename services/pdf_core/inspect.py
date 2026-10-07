@@ -41,3 +41,16 @@ def inspect_pdf(path: Path, max_xrefs_scanned: int = 200_000) -> dict:
                     findings.add(name)
         info["active_content"] = sorted(findings)
         return info
+
+
+def page_geometry(path: Path) -> list[dict]:
+    """Unrotated size and /Rotate of every page, so the editor can lay out before analysis."""
+    with fitz.open(path) as doc:
+        out = []
+        for page in doc:
+            rotation = page.rotation
+            if rotation:
+                page.set_rotation(0)
+            rect = page.rect
+            out.append({"width_pt": round(rect.width, 3), "height_pt": round(rect.height, 3), "rotation": rotation})
+        return out

@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 
 from pdf_core.analyzer import analyze_page
 from pdf_core.geometry import PageSpace
-from pdf_core.inspect import inspect_pdf
+from pdf_core.inspect import inspect_pdf, page_geometry
 from pdf_core.mutation import MutationError, apply_batch
 from pdf_core.reconcile import reconcile
 from pdf_core.validation import qpdf_check, validate_revision
@@ -72,11 +72,11 @@ def ingest_document(document_id: str) -> dict:
             return {"status": "failed", "error": error}
         page_map = []
         first_version_id = None
-        for _ in range(info["page_count"]):
+        for geometry in page_geometry(store.path(document.original_blob_key)):
             page = Page(document_id=document.id)
             db.add(page)
             db.flush()
-            version = PageVersion(page_id=page.id, document_id=document.id, version=1)
+            version = PageVersion(page_id=page.id, document_id=document.id, version=1, **geometry)
             db.add(version)
             db.flush()
             first_version_id = first_version_id or version.id
@@ -350,8 +350,13 @@ def _next_page_map(db, document_id: str, old_map: list[dict], result) -> list[di
             continue
         latest = db.scalar(select(PageVersion.version).where(PageVersion.page_id == entry["page_id"])
                            .order_by(PageVersion.version.desc()).limit(1)) or entry["version"]
+        parent = db.scalar(select(PageVersion).where(PageVersion.page_id == entry["page_id"],
+                                                     PageVersion.version == entry["version"]))
         version = PageVersion(page_id=entry["page_id"], document_id=document_id, version=latest + 1,
-                              parent_version=entry["version"], edited_hints=hints_by_page.get(src, {}))
+                              parent_version=entry["version"], edited_hints=hints_by_page.get(src, {}),
+                              width_pt=parent.width_pt if parent else None,
+                              height_pt=parent.height_pt if parent else None,
+                              rotation=parent.rotation if parent else None)  # refreshed by analysis
         db.add(version)
         db.flush()
         new_map.append({"page_id": entry["page_id"], "version": version.version})

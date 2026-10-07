@@ -1,0 +1,11 @@
+{
+  "name": "verso-folio",
+  "private": true,
+  "workspaces": ["packages/*", "apps/web"],
+  "scripts": {
+    "dev": "npm --workspace apps/web run dev",
+    "build": "npm --workspace apps/web run build",
+    "test": "npm --workspaces --if-present run test",
+    "typecheck": "npm --workspaces --if-present run typecheck"
+  }
+}

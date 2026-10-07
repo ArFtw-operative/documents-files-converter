@@ -7,11 +7,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import BatchStatus, DocumentRevision, Export, OperationBatch, PageVersion, User
+from ..models import BatchStatus, DocumentRevision, Export, OperationBatch, PageVersion, SceneObjectRow, User
 from ..security.deps import Principal, current_principal, current_user
 from ..services import audit, documents, editing
 from ..services.engine_runner import P1_VISIBLE, P2_NEARBY, P3_BACKGROUND, enqueue, run
@@ -140,14 +140,20 @@ def list_pages(document_id: str, revision: int | None = None, user: User = Depen
 
 
 @router.get("/{document_id}/pages/{page_id}/scene")
-def page_scene(document_id: str, page_id: str, revision: int | None = None, diagnostics: bool = False,
-               user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+def page_scene(document_id: str, page_id: str, revision: int | None = None, version: int | None = None,
+               diagnostics: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    """Scene of one page. ``version`` pins an exact (immutable) page version; otherwise the page as
+    it is in ``revision`` (default: current)."""
     document = documents.get_owned_document(db, user, document_id, allow_processing=False)
     revision_row = documents.revision_row(db, document, revision)
     index = next((i for i, e in enumerate(revision_row.page_map) if e["page_id"] == page_id), None)
-    if index is None:
-        raise NotFound("Page not found in this revision.")
-    entry = revision_row.page_map[index]
+    if version is None:
+        if index is None:
+            raise NotFound("Page not found in this revision.")
+        entry = revision_row.page_map[index]
+    else:
+        entry = {"page_id": page_id, "version": version}
+        index = index if index is not None else 0
     version = documents.page_version(db, document.id, page_id, entry["version"])
     if version.analysis_status != "ready":
         run("analyze_page_version", version.id, queue="analysis", priority=P1_VISIBLE)
@@ -177,6 +183,29 @@ def prioritise_analysis(document_id: str, body: AnalyzeIn, user: User = Depends(
             enqueue("analyze_page_version", version.id, queue="analysis", priority=priority)
             queued += 1
     return {"queued": queued}
+
+
+@router.get("/{document_id}/search")
+def search(document_id: str, q: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    """Unified text search over analysed pages of the current revision (§38)."""
+    document = documents.get_owned_document(db, user, document_id, allow_processing=False)
+    needle = q.strip().lower()[:200]
+    if not needle:
+        return {"results": [], "pending_pages": 0}
+    revision_row = documents.revision_row(db, document)
+    index_of = {(e["page_id"], e["version"]): i for i, e in enumerate(revision_row.page_map)}
+    versions = db.scalars(select(PageVersion).where(PageVersion.document_id == document.id)).all()
+    wanted = {v.id: index_of[(v.page_id, v.version)] for v in versions if (v.page_id, v.version) in index_of}
+    pending = sum(1 for v in versions if v.id in wanted and v.analysis_status != "ready")
+    rows = db.execute(
+        select(SceneObjectRow.page_version_id, SceneObjectRow.object_id, SceneObjectRow.text)
+        .where(SceneObjectRow.page_version_id.in_(list(wanted)), SceneObjectRow.text.is_not(None),
+               func.lower(SceneObjectRow.text).contains(needle, autoescape=True))
+        .limit(1000)).all()
+    page_ids = {v.id: v.page_id for v in versions}
+    results = sorted(({"page_index": wanted[r.page_version_id], "page_id": page_ids[r.page_version_id],
+                       "object_id": r.object_id, "text": r.text} for r in rows), key=lambda r: r["page_index"])
+    return {"results": results, "pending_pages": pending}
 
 
 @router.get("/{document_id}/revisions")
