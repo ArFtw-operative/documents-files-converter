@@ -91,6 +91,19 @@ def base14_text(path: Path) -> Path:
     return path
 
 
+def nonembedded_courier(path: Path) -> Path:
+    """Office-style PDF referencing a Windows font by name only (like CourierNew,Bold), not embedded."""
+    doc = fitz.open()
+    page = doc.new_page(width=596, height=842)
+    page.insert_text((12, 25), "SAMICO PHARMA", fontname="cobo", fontsize=14)
+    page.insert_text((12, 60), "GSTIN 32AAAAA0000A1Z5", fontname="cour", fontsize=9)
+    for xref, _ext, _type, basefont, *_ in page.get_fonts(full=True):
+        doc.xref_set_key(xref, "BaseFont", "/CourierNew,Bold" if "Bold" in basefont else "/CourierNew")
+        doc.xref_set_key(xref, "Encoding", "/WinAnsiEncoding")
+    doc.save(path, garbage=3, deflate=True)
+    return path
+
+
 def multipage(path: Path, pages: int = 3) -> Path:
     doc = fitz.open()
     for _ in range(pages):
@@ -107,6 +120,7 @@ ALL = {
     "cropped_page.pdf": cropped_page,
     "base14_text.pdf": base14_text,
     "multipage.pdf": multipage,
+    "nonembedded_courier.pdf": nonembedded_courier,
 }
 
 

@@ -207,3 +207,28 @@ def test_reconcile_preserves_ids_for_unchanged_and_edited_objects(golden, tmp_pa
     assert find(after, "4593.00").id == target.id
     assert find(after, "VISHNU MEDICAL HALL").id == find(before, "VISHNU MEDICAL HALL").id
     assert len({o.id for o in after.objects}) == len(after.objects)
+
+
+def test_nonembedded_font_reuses_the_page_font_resource(golden, tmp_path):
+    source = golden["nonembedded_courier.pdf"]
+    _, target, output, result = edit(source, tmp_path, "SAMICO PHARMA", "SAMICO PHARMA Tr!")
+    assert target.style["font_name"] == "CourierNew,Bold" and not target.style["embedded"]
+    check_valid(source, output, result)
+    assert result.warnings == []
+    assert result.outcomes[0].fit["font_source"] == "pdf_resource"
+    edited = find(scene(output), "SAMICO PHARMA Tr!")
+    assert edited.style["font_name"] == "CourierNew,Bold"
+    assert abs(edited.content["baseline_origin"][0] - target.content["baseline_origin"][0]) < 0.01
+    # Courier metrics: 17 glyphs x 0.6 em x 14 pt
+    assert abs(edited.content["advance_pt"] - 17 * 0.6 * 14) < 0.5
+    with fitz.open(output) as doc:
+        assert all(ext == "n/a" for _x, ext, *_ in doc[0].get_fonts(full=True))  # nothing new embedded
+
+
+def test_nonembedded_font_without_the_glyph_falls_back_quietly(golden, tmp_path):
+    source = golden["nonembedded_courier.pdf"]
+    _, _, output, result = edit(source, tmp_path, "SAMICO PHARMA", "SAMICO ₹ PHARMA")
+    check_valid(source, output, result)
+    assert "font_substituted" not in result.warnings
+    assert {s["reason"] for s in result.outcomes[0].substitutions} == {"not_embedded"}
+    assert "SAMICO ₹ PHARMA" in texts(scene(output))

@@ -9,7 +9,11 @@ import pymupdf as fitz
 from ..fonts.resolver import FontPlan, FontResolver, ResolvedFont
 from ..geometry import PageSpace, glyph_quad, quad_bbox, unrotated
 from ..scene import ObjectType, PageScene, SceneObject
+from . import resource_font
 from .errors import MutationError
+
+# Substitution reasons that change the visible typeface.
+WARN_REASONS = {"glyph_missing", "font_not_reusable"}
 
 # Preserve-box limits (§14.1). Anything beyond needs explicit confirmation.
 MAX_TRACKING_FRACTION = 0.05
@@ -214,26 +218,38 @@ def replace_text(document: fitz.Document, resolver: FontResolver, scene: PageSce
     outcome = EditOutcome(scene.page_index, target.id, "replace_text", new_text)
     with unrotated(page):
         space = PageSpace(page)
-        plan = resolver.plan(new_text, style, target.native_ref.get("font_xref"))
-        missing = sorted({c for c, f in plan.chars if f is None and not c.isspace()})
-        if missing:
-            raise MutationError("font_unavailable", "No installed font can display: " + "".join(missing),
-                                {"characters": missing})
         tracking = float(style.get("letter_spacing_pt") or 0.0)
         space_width = float(style.get("space_width_pt") or size * 0.25)
-        placed, width = _layout(plan, size, tracking, space_width)
         old_advance = float(target.content["advance_pt"])
+        render_mode = _RENDER_MODE.get(style.get("render_mode", "fill"), 0)
+        # Prefer the page's own (non-embedded) font resource so the edit renders exactly like its
+        # neighbours in every viewer; otherwise embed the resolved font.
+        resource = None
+        if float(style.get("opacity", 1.0)) >= 1.0:
+            resource = resource_font.find(document, page, target.native_ref.get("font_xref"), style, resolver)
+        encoded = resource.encode(new_text) if resource else None
+        plan: FontPlan | None = None
+        if resource is not None and encoded is not None:
+            def measure(sz: float, tr: float) -> float:
+                return resource.width(encoded, new_text, sz, tr)
+        else:
+            plan = resolver.plan(new_text, style, target.native_ref.get("font_xref"))
+            missing = sorted({c for c, f in plan.chars if f is None and not c.isspace()})
+            if missing:
+                raise MutationError("font_unavailable", "No installed font can display: " + "".join(missing),
+                                    {"characters": missing})
+
+            def measure(sz: float, tr: float) -> float:
+                return _layout(plan, sz, tr, space_width * sz / size)[1]
+        width = measure(size, tracking)
         if payload.get("reflow", "preserve_box") == "preserve_box":
             available = _available_width(page, space, scene, target, align)
-            fit = _fit(width, max(0, len(placed) - 1), size, available, bool(payload.get("allow_overflow")))
+            fit = _fit(width, max(0, len(new_text) - 1), size, available, bool(payload.get("allow_overflow")))
         else:
             fit = {"tracking_delta": 0.0, "hscale": 1.0, "size_factor": 1.0, "overflow": False}
-        if fit["tracking_delta"] or fit["size_factor"] != 1.0:
-            size_eff = size * fit["size_factor"]
-            placed, width = _layout(plan, size_eff, (tracking + fit["tracking_delta"]) * fit["size_factor"],
-                                    space_width * fit["size_factor"])
-        else:
-            size_eff = size
+        size_eff = size * fit["size_factor"]
+        tracking_eff = (tracking + fit["tracking_delta"]) * fit["size_factor"]
+        width = measure(size_eff, tracking_eff)
         final_width = width * fit["hscale"]
         shift = {"right": old_advance - final_width, "center": (old_advance - final_width) / 2}.get(align, 0.0)
         ox, oy = target.native_ref["origin"]
@@ -241,11 +257,17 @@ def replace_text(document: fitz.Document, resolver: FontResolver, scene: PageSce
         origin = fitz.Point(ox + dx * shift, oy + dy * shift)
 
         remove_glyphs(page, space, target)
-        rgb, exact = _rgb(style.get("fill_components") or [], style.get("fill") or style.get("stroke"))
-        if not exact:
-            outcome.warnings.append("color_converted_to_rgb")
-        _write(page, placed, space.point(origin.x, origin.y), (dx, -dy), size_eff, fit["hscale"], rgb,
-               float(style.get("opacity", 1.0)), _RENDER_MODE.get(style.get("render_mode", "fill"), 0))
+        if plan is None:
+            resource_font.write(document, page, resource, encoded, space.point(origin.x, origin.y), (dx, -dy),
+                                size_eff, tracking_eff, fit["hscale"], style.get("fill_components") or [0.0],
+                                render_mode)
+        else:
+            placed, _ = _layout(plan, size_eff, tracking_eff, space_width * fit["size_factor"])
+            rgb, exact = _rgb(style.get("fill_components") or [], style.get("fill") or style.get("stroke"))
+            if not exact:
+                outcome.warnings.append("color_converted_to_rgb")
+            _write(page, placed, space.point(origin.x, origin.y), (dx, -dy), size_eff, fit["hscale"], rgb,
+                   float(style.get("opacity", 1.0)), render_mode)
 
         ascent = float(style.get("ascender", 0.9)) * size_eff
         descent = float(style.get("descender", -0.2)) * size_eff
@@ -254,9 +276,11 @@ def replace_text(document: fitz.Document, resolver: FontResolver, scene: PageSce
     old = target.bbox
     outcome.region = [min(old[0], outcome.new_bbox[0]), min(old[1], outcome.new_bbox[1]),
                       max(old[2], outcome.new_bbox[2]), max(old[3], outcome.new_bbox[3])]
-    outcome.fit = {**fit, "align": align, "size_pt": round(size_eff, 3)}
-    outcome.substitutions = [s.__dict__ for s in plan.substitutions]
-    if any(s.reason != "same_family_installed" for s in plan.substitutions):
+    font_source = "pdf_resource" if plan is None else (plan.primary.source if plan.primary else "none")
+    outcome.fit = {**fit, "align": align, "size_pt": round(size_eff, 3), "font_source": font_source}
+    outcome.substitutions = [] if plan is None else [s.__dict__ for s in plan.substitutions]
+    # Only a visible change of typeface is worth a warning (§68); installed equivalents are not.
+    if any(s["reason"] in WARN_REASONS for s in outcome.substitutions):
         outcome.warnings.append("font_substituted")
     if fit["hscale"] < 1 or fit["size_factor"] < 1:
         outcome.warnings.append("text_adjusted_to_fit")

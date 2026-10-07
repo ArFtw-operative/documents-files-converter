@@ -12,6 +12,7 @@ x-app-env: &app-env
   FOLIO_ENGINE_MODE: worker
   FOLIO_COOKIE_SECURE: "true"
   FOLIO_MAX_UPLOAD_BYTES: ${FOLIO_MAX_UPLOAD_BYTES:-209715200}
+  XDG_CACHE_HOME: /tmp/cache  # fontconfig user cache on tmpfs (root filesystem is read-only)
 
 x-hardening: &hardening
   read_only: true

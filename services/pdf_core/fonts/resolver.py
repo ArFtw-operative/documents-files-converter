@@ -141,6 +141,7 @@ class FontResolver:
         self.max_trace_pages = max_trace_pages
         self._usage: dict[str, dict[str, int]] | None = None
         self._embedded: dict[int, ResolvedFont | None] = {}
+        self._not_embedded: set[int] = set()  # fonts the PDF only references by name
 
     # Unicode → glyph id for every font name, learned from the document's text trace.
     def usage(self, font_name: str) -> dict[str, int]:
@@ -183,6 +184,8 @@ class FontResolver:
                         resolved = None
         elif not buffer:
             resolved = self._base14(name)
+            if resolved is None:
+                self._not_embedded.add(xref)
         self._embedded[xref] = resolved
         return resolved
 
@@ -241,7 +244,12 @@ class FontResolver:
                 chosen = self.system(family, bold, italic, serif, mono, char)
             if chosen is not primary and not char.isspace():
                 used = chosen.name if chosen else "none"
-                reason = "glyph_missing" if primary else "font_not_reusable"
+                if primary:
+                    reason = "glyph_missing"
+                elif font_xref in self._not_embedded:
+                    reason = "not_embedded"  # viewers substitute this font anyway; not a visible change
+                else:
+                    reason = "font_not_reusable"
                 key = f"{used}:{reason}"
                 entry = substitutions.setdefault(key, Substitution("", font_name, used, reason))
                 if char not in entry.chars:

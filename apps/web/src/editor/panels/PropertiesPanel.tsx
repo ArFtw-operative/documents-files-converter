@@ -25,7 +25,8 @@ function TextProperties({ obj }: { obj: SceneObject }) {
   const s = obj.style;
   const result = useJobs((j) => j.lastResult);
   const outcome = result?.outcome.outcomes?.find((o) => o.object_id === obj.id);
-  const substitution = outcome?.substitutions.find((x) => x.reason !== "same_family_installed");
+  const substitution = outcome?.substitutions.find((x) => x.reason === "glyph_missing" || x.reason === "font_not_reusable");
+  const notEmbedded = outcome?.substitutions.find((x) => x.reason === "not_embedded");
   return (
     <section className="space-y-2">
       <h2 className="font-semibold">Text</h2>
@@ -49,7 +50,16 @@ function TextProperties({ obj }: { obj: SceneObject }) {
       {substitution && (
         <p className="text-xs flex gap-2 rounded-md p-2 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200">
           <AlertTriangle size={14} className="shrink-0 mt-0.5" aria-hidden />
-          <span>The original font does not contain “{substitution.chars}”. Used the closest match ({substitution.used_font}).</span>
+          <span>
+            {substitution.reason === "glyph_missing"
+              ? `The original font does not contain “${substitution.chars}”. Used the closest match (${substitution.used_font}) for ${substitution.chars.length === 1 ? "it" : "those characters"}.`
+              : `The original font could not be reused here. Used the closest match (${substitution.used_font}).`}
+          </span>
+        </p>
+      )}
+      {notEmbedded && !substitution && (
+        <p className="text-xs muted">
+          {String(s.font_name)} is not embedded in this PDF, so viewers use an installed equivalent. The edit uses {notEmbedded.used_font} for “{notEmbedded.chars}”.
         </p>
       )}
       {outcome?.warnings.includes("text_adjusted_to_fit") && (
