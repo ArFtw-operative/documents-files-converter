@@ -1,12 +1,19 @@
 import os
+import sys
 from pathlib import Path
 
-os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault("DATABASE_URL", "sqlite:///./data/test-convertvault.db")
-os.environ.setdefault("STORAGE_PROVIDER", "local")
-os.environ.setdefault("LOCAL_STORAGE_PATH", "./data/test-files")
+ROOT = Path(__file__).resolve().parents[1]
+for path in (ROOT / "apps" / "api", ROOT / "services", ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-database = Path("data/test-convertvault.db")
-database.parent.mkdir(exist_ok=True)
-database.unlink(missing_ok=True)
+os.environ.setdefault("FOLIO_ENV", "test")
 
+import pytest  # noqa: E402
+
+from tests.golden.generate import build_all  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def golden(tmp_path_factory) -> dict[str, Path]:
+    return build_all(tmp_path_factory.mktemp("golden"))

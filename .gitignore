@@ -13,3 +13,5 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+.env.folio
+/data-folio/

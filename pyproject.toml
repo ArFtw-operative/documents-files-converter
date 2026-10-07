@@ -1,12 +1,17 @@
+[project]
+name = "verso-folio"
+version = "0.1.0"
+requires-python = ">=3.12"
+
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py312"
+extend-exclude = ["legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S"]
-ignore = ["S101"]
+ignore = ["S101", "S603", "S607"]
 
 [tool.pytest.ini_options]
-pythonpath = ["apps/api"]
 testpaths = ["tests"]
-
+norecursedirs = ["legacy", "node_modules"]
